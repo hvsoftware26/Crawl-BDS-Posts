@@ -12,10 +12,7 @@ from resources.ui.gui import MultiProfileDialog, Ui_MainWindow, create_applicati
 from services.ai_service import OpenAIService
 from models.account import Info_data
 from workers.process_worker import Worker_Handle
-
-
-from PyQt5.QtCore import QThread
-from playwright.sync_api import sync_playwright
+from config import CHROME_PATH
 
 
 class CREATE_PROFILE(QThread):
@@ -35,12 +32,31 @@ class CREATE_PROFILE(QThread):
             with sync_playwright() as p:
                 context = p.chromium.launch_persistent_context(
                     user_data_dir=path_chrome,
+                    executable_path=CHROME_PATH,
                     headless=headless,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+                    args=[
+                        "--no-sandbox",
+                        "--disable-setuid-sandbox",
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                    ],
                 )
 
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto("https://www.facebook.com/", wait_until="load")
+                page = next((p for p in context.pages if not p.is_closed()), None)
+                if page is None:
+                    page = context.new_page()
+
+                try:
+                    page.goto(
+                        "https://www.facebook.com/?locale=vi_VN",
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                except Exception as e:
+                    print("⚠️ Không điều hướng được Facebook:", e)
+                    if headless:
+                        raise
 
                 # Headless thì chạy xong đóng luôn
                 if headless:
@@ -49,9 +65,10 @@ class CREATE_PROFILE(QThread):
                 # Không headless thì giữ Chrome mở cho tới khi user bấm X
                 while True:
                     try:
-                        if len(context.pages) == 0:
+                        open_pages = [opened_page for opened_page in context.pages if not opened_page.is_closed()]
+                        if not open_pages:
                             break
-                        context.pages[0].wait_for_timeout(1000)
+                        open_pages[0].wait_for_timeout(1000)
                     except Exception:
                         break
 
@@ -85,6 +102,8 @@ class MainWindow(QMainWindow):
         self.delay_get_post_gr = None
         self.keywords_list = None
         self.workers = []
+        self.profile_threads = []
+        self.view_chrome = None
         self.is_running = False
 
         self._connect_signals()
@@ -134,6 +153,15 @@ class MainWindow(QMainWindow):
         if not self.workers:
             self.is_running = False
             self.append_log("Tất cả worker đã kết thúc.")
+
+    def _cleanup_profile_threads(self):
+        self.profile_threads = [thread for thread in self.profile_threads if thread.isRunning()]
+        if self.view_chrome and not self.view_chrome.isRunning():
+            self.view_chrome = None
+
+    def _track_profile_thread(self, thread: CREATE_PROFILE):
+        self.profile_threads.append(thread)
+        thread.finished.connect(self._cleanup_profile_threads)
 
     
     def on_post_signal(self, row: int, status: int):
@@ -266,6 +294,7 @@ class MainWindow(QMainWindow):
                     proxy = "Không"
                     path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
                     create_profile = CREATE_PROFILE(path_chrome, True)
+                    self._track_profile_thread(create_profile)
                     create_profile.start()
                 else:
                     if len(count_element) != 5:
@@ -274,6 +303,7 @@ class MainWindow(QMainWindow):
                     account_name, proxy, email, password, twofa = count_element
                     path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
                     create_profile = CREATE_PROFILE(path_chrome, True)
+                    self._track_profile_thread(create_profile)
                     create_profile.start()
             except Exception:
                 QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
@@ -607,8 +637,13 @@ class MainWindow(QMainWindow):
         if not checked_paths:
             QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để mở chrome.')
             return
-        
+
+        if self.view_chrome and self.view_chrome.isRunning():
+            QMessageBox.information(self, 'Thông báo', 'Một profile Chrome đang mở. Hãy đóng cửa sổ đó trước.')
+            return
+
         self.view_chrome = CREATE_PROFILE(checked_paths[0], False)
+        self._track_profile_thread(self.view_chrome)
         self.view_chrome.start()
 
         # QMessageBox.information(self, 'Thông báo', f'Đã check live die {len(checked_paths)} tài khoản.')

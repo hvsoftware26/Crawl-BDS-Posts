@@ -60,8 +60,8 @@ def is_created_time_within_delay_window(
         reference_time = reference_time.replace(tzinfo=HANOI_TIMEZONE)
 
     parsed_time = parsed_time.astimezone(reference_time.tzinfo)
-    # window_start = reference_time - timedelta(seconds=max(delay_seconds, 0))
-    window_start = reference_time - timedelta(hours=10)
+    window_start = reference_time - timedelta(seconds=max(delay_seconds, 0))
+    #window_start = reference_time - timedelta(hours=10)
     if not (window_start <= parsed_time <= reference_time):
         logger.debug(
             "Post created_time %s is outside the delay window: parsed_time=%s window_start=%s reference_time=%s",
