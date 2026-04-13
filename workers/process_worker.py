@@ -3,6 +3,7 @@ import requests
 import random
 import logging
 import time
+import threading
 from logging import getLogger
 from controllers.scan_controller import ScanController
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -45,6 +46,7 @@ class Worker_Handle(QThread):
         self.eaag_token = None
 
         self._stop_requested = False
+        self._playwright_thread_id = None
 
     # =========================
     # Logging helpers
@@ -65,14 +67,12 @@ class Worker_Handle(QThread):
     # Stop helpers
     # =========================
     def stop(self):
-        self._stop_requested = True
-        self.log_row("Đang yêu cầu dừng...")
+        if self._stop_requested:
+            return
 
-        try:
-            if self.page:
-                self.page.close()
-        except Exception:
-            pass
+        self._stop_requested = True
+        self.requestInterruption()
+        self.log_row("Đang yêu cầu dừng...")
 
     def is_stop_requested(self) -> bool:
         return self._stop_requested
@@ -105,6 +105,7 @@ class Worker_Handle(QThread):
         self.ensure_not_stopped()
         self.log_row("Đang khởi động trình duyệt")
 
+        self._playwright_thread_id = threading.get_ident()
         self.playwright = sync_playwright().start()
         self.context = self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.task.path_chrome,
@@ -136,8 +137,21 @@ class Worker_Handle(QThread):
         pages = self.context.pages
         self.page = pages[0] if pages else self.context.new_page()
         self.page.set_default_timeout(30000)
+        self.page.set_default_navigation_timeout(20000)
 
     def close(self):
+        if (
+            self._playwright_thread_id is not None
+            and threading.get_ident() != self._playwright_thread_id
+        ):
+            logger.warning(
+                "[Row %s] Bỏ qua cleanup Playwright từ thread khác: current=%s expected=%s",
+                self.row,
+                threading.get_ident(),
+                self._playwright_thread_id,
+            )
+            return
+
         try:
             if self.context:
                 self.context.close()
@@ -154,6 +168,7 @@ class Worker_Handle(QThread):
             logger.error(f"[Row {self.row}] Lỗi khi stop playwright: {e}")
         finally:
             self.playwright = None
+            self._playwright_thread_id = None
 
     def safe_goto(self, url: str, wait_until: str = "load", retry: int = 2) -> bool:
         last_error = None
@@ -221,6 +236,188 @@ class Worker_Handle(QThread):
     def get_cookie_raw(self) -> str:
         cookies = self.context.cookies()
         return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+
+    def get_facebook_cookie_map(self) -> dict[str, str]:
+        if not self.context:
+            return {}
+
+        try:
+            cookies = self.context.cookies(["https://www.facebook.com"])
+        except Exception as e:
+            logger.warning(f"[Row {self.row}] Không đọc được cookie Facebook: {e}")
+            return {}
+
+        return {
+            str(cookie.get("name")): str(cookie.get("value"))
+            for cookie in cookies
+            if cookie.get("name")
+        }
+
+    def has_active_facebook_session(self) -> bool:
+        cookie_map = self.get_facebook_cookie_map()
+        return bool(cookie_map.get("c_user") and cookie_map.get("xs"))
+
+    def wait_and_fill_css(
+        self,
+        selector: str,
+        value: str,
+        timeout: int = 15000,
+        log_errors: bool = False,
+    ) -> bool:
+        if self._stop_requested:
+            return False
+
+        try:
+            locator = self.page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout)
+            locator.scroll_into_view_if_needed()
+            locator.fill(str(value))
+            return True
+        except Exception as e:
+            if log_errors:
+                logger.error(f"[Row {self.row}] Lỗi fill selector={selector}: {e}")
+            return False
+
+    def wait_and_click_css(
+        self,
+        selector: str,
+        timeout: int = 15000,
+        log_errors: bool = False,
+    ) -> bool:
+        if self._stop_requested:
+            return False
+
+        try:
+            locator = self.page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout)
+            locator.scroll_into_view_if_needed()
+            locator.click(timeout=timeout)
+            return True
+        except Exception as e:
+            if log_errors:
+                logger.error(f"[Row {self.row}] Lỗi click selector={selector}: {e}")
+            return False
+
+    def is_css_visible(self, selector: str, timeout: int = 3000) -> bool:
+        if self._stop_requested:
+            return False
+
+        try:
+            locator = self.page.locator(selector).first
+            locator.wait_for(state="visible", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def click_first_visible(self, selectors: list[str], timeout: int = 5000) -> bool:
+        for selector in selectors:
+            if self.wait_and_click_css(selector, timeout=timeout, log_errors=False):
+                return True
+        return False
+
+    def fill_login_form(self) -> bool:
+        filled_any = False
+
+        if getattr(self.task, "email", None):
+            if self.wait_and_fill_css(
+                'input[name="email"]',
+                self.task.email,
+                timeout=5000,
+                log_errors=False,
+            ):
+                self.log_row("Đã nhập email đăng nhập")
+                filled_any = True
+
+        if getattr(self.task, "password", None):
+            if self.wait_and_fill_css(
+                'input[name="pass"]',
+                self.task.password,
+                timeout=5000,
+                log_errors=False,
+            ):
+                self.log_row("Đã nhập mật khẩu đăng nhập")
+                filled_any = True
+
+        return filled_any
+
+    def submit_login_form(self) -> bool:
+        login_selectors = [
+            'button[name="login"]',
+            'div[role="button"]:has-text("Đăng nhập")',
+            'div[role="button"]:has-text("Log in")',
+            'text="Đăng nhập"',
+            'text="Log in"',
+        ]
+
+        if self.click_first_visible(login_selectors, timeout=5000):
+            self.log_row("Đã gửi form đăng nhập")
+            return True
+
+        try:
+            password_locator = self.page.locator('input[name="pass"]').first
+            password_locator.wait_for(state="visible", timeout=3000)
+            password_locator.press("Enter")
+            self.log_row("Đã gửi form đăng nhập bằng Enter")
+            return True
+        except Exception as e:
+            logger.error(f"[Row {self.row}] Không submit được form đăng nhập: {e}")
+            return False
+
+    def relogin_once(self, attempt_number: int) -> bool:
+        self.log_row(f"Thử đăng nhập lại (lần {attempt_number})")
+
+        if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+            if not self._stop_requested:
+                self.log_row("Không vào được Facebook")
+            return False
+
+        if not self.sleep_with_stop(2):
+            return False
+
+        if self.is_logged_in():
+            return True
+
+        clicked_continue = self.click_first_visible(
+            [
+                'div[role="button"]:has-text("Tiếp tục")',
+                'div[role="button"]:has-text("Continue")',
+                'text="Tiếp tục"',
+                'text="Continue"',
+            ],
+            timeout=3000,
+        )
+        if clicked_continue:
+            self.log_row("Đã click nút tiếp tục phiên đăng nhập")
+            if not self.sleep_with_stop(2):
+                return False
+
+        filled_login_form = self.fill_login_form()
+
+        if not filled_login_form and not clicked_continue:
+            self.log_row("Không tìm thấy form đăng nhập hoặc nút tiếp tục")
+            return False
+
+        if filled_login_form and not self.submit_login_form():
+            return False
+
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+
+        if not self.sleep_with_stop(3):
+            return False
+
+        if not self.handle_2fa_if_present():
+            if self._stop_requested:
+                return False
+            self.log_row("Xử lý 2FA chưa thành công")
+            return False
+
+        if not self.sleep_with_stop(2):
+            return False
+
+        return self.is_logged_in()
 
     # =========================
     # 2FA / capture
@@ -330,21 +527,52 @@ class Worker_Handle(QThread):
             return False
 
         try:
+            current_url = (self.page.url or "").lower()
+            has_session = self.has_active_facebook_session()
+
+            if (
+                has_session
+                and "login" not in current_url
+                and "checkpoint" not in current_url
+                and "two_factor" not in current_url
+                and "recover" not in current_url
+            ):
+                return True
+
+            if self.is_css_visible('input[name="email"]', timeout=2000):
+                logger.info(
+                    f"[Row {self.row}] Phát hiện form email đăng nhập. url={current_url} has_session={has_session}"
+                )
+                return False
+
+            if self.is_css_visible('input[name="pass"]', timeout=2000) and not has_session:
+                logger.info(
+                    f"[Row {self.row}] Phát hiện form mật khẩu đăng nhập. url={current_url} has_session={has_session}"
+                )
+                return False
+
             body = self.page.locator("body")
-            body.wait_for(state="visible", timeout=10000)
-            body_text = body.inner_text(timeout=10000).lower()
+            body.wait_for(state="visible", timeout=5000)
+            body_text = body.inner_text(timeout=5000).lower()
 
             if (
                 "bạn đang nghĩ gì thế" in body_text
                 or "what's on your mind" in body_text
                 or "what’s on your mind" in body_text
+                or "meta business suite" in body_text
+                or "business locations" in body_text
             ):
                 return True
 
-            if self.page.locator('input[name="email"]').count() > 0:
+            if (
+                "đăng nhập vào facebook" in body_text
+                or "log into facebook" in body_text
+                or "quên mật khẩu" in body_text
+                or "forgotten password" in body_text
+            ):
                 return False
 
-            return False
+            return has_session
         except Exception as e:
             logger.error(f"[Row {self.row}] Lỗi kiểm tra login: {e}")
             return False
@@ -381,89 +609,30 @@ class Worker_Handle(QThread):
                     count = 0
                     relogin_success = False
 
-                    while count < 5 and not self.is_logged_in():
+                    while count < 5:
                         if self._stop_requested:
                             return None, None
 
                         count += 1
-                        self.log_row(f"Thử đăng nhập lại (lần {count})")
-
-                        if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
-                            if self._stop_requested:
-                                return None, None
-                            self.log_row("Không vào được Facebook")
-                            continue
-
                         try:
-                            self.page.evaluate("""
-                            () => {
-                                const el = [...document.querySelectorAll("span")]
-                                    .find(e => e.innerText.trim() === "Tiếp tục");
-                                if (el) {
-                                    el.click();
-                                    return "clicked";
-                                }
-                                return "not_found";
-                            }
-                            """)
-
-                            if not self.sleep_with_stop(4):
-                                return None, None
-
-                            self.page.evaluate(
-                                """(password) => {
-                                    const input = document.querySelector('input[name="pass"]');
-                                    if (!input) return "not_found";
-
-                                    const nativeSetter = Object.getOwnPropertyDescriptor(
-                                        HTMLInputElement.prototype,
-                                        "value"
-                                    ).set;
-
-                                    input.focus();
-                                    nativeSetter.call(input, password);
-                                    input.dispatchEvent(new Event("input", { bubbles: true }));
-                                    input.dispatchEvent(new Event("change", { bubbles: true }));
-                                    input.blur();
-
-                                    return "filled";
-                                }""",
-                                self.task.password
-                            )
-
-                            if not self.sleep_with_stop(4):
-                                return None, None
-
-                            self.page.evaluate("""
-                            () => {
-                                const spans = [...document.querySelectorAll("span")];
-                                const btn = spans.find(el =>
-                                    el.innerText.trim() === "Đăng nhập" &&
-                                    el.closest('div[role="button"]')
-                                );
-                                if (!btn) return "not_found";
-                                btn.closest('div[role="button"]').click();
-                                return "clicked";
-                            }
-                            """)
-
-                            if not self.sleep_with_stop(3):
-                                return None, None
-
-                            if self.is_logged_in():
-                                relogin_success = True
-                                self.log_row("Đăng nhập lại thành công")
-                                break
-
-                            self.log_row("Đăng nhập lại chưa thành công, sẽ thử lại")
-
+                            relogin_success = self.relogin_once(count)
                         except Exception as e:
                             if self._stop_requested:
                                 return None, None
                             logger.error(f"[Row {self.row}] Lỗi quá trình đăng nhập lại lần {count}: {e}")
-                            continue
+                            relogin_success = False
+
+                        if relogin_success:
+                            self.log_row("Đăng nhập lại thành công")
+                            break
+
+                        self.log_row("Đăng nhập lại chưa thành công, sẽ thử lại")
+
+                        if count < 5 and not self.sleep_with_stop(2):
+                            return None, None
 
                     if not relogin_success:
+                        self.log_row("Đăng nhập lại thất bại sau nhiều lần thử")
                         return None, None
 
                 if self._stop_requested:

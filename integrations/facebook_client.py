@@ -8,6 +8,17 @@ from config import build_headers, build_params
 logger = getLogger(__name__)
 
 
+def _sleep_with_stop(seconds: float, stop_callback=None) -> bool:
+    if seconds <= 0:
+        return True
+
+    for _ in range(int(seconds * 10)):
+        if stop_callback and stop_callback():
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def _extract_numeric_group_id(group_input: str) -> str | None:
     """
     Trả về group id nếu input đã chứa UID số.
@@ -121,13 +132,18 @@ class FacebookClient:
         self,
         group_id: str,
         account_token: str,
-        account_cookies: str, proxies: dict = None):
+        account_cookies: str,
+        proxies: dict = None,
+        stop_callback=None,
+    ):
         """
         Lấy page đầu tiên của post trong group.
         - Nếu input là ID số hoặc link có ID số: không gọi TDS
         - Nếu input là link slug/user: mới gọi TDS để convert
         """
-        time.sleep(5)
+        if not _sleep_with_stop(5, stop_callback):
+            logger.info("Stop requested before fetching first page: raw_group_input=%s", group_id)
+            return {"id": None, "posts": [], "next_api": None, "stopped": True}
         logger.info(
             "Fetching first page of posts: raw_group_input=%s has_proxies=%s has_token=%s has_cookies=%s",
             group_id,
@@ -177,7 +193,9 @@ class FacebookClient:
             raw_group_input=raw_group_input,
         )
 
-        time.sleep(5)
+        if not _sleep_with_stop(5, stop_callback):
+            logger.info("Stop requested after fetching first page: resolved_group_id=%s", resolved_group_id)
+            return {"id": payload.get("id"), "posts": [], "next_api": None, "stopped": True}
 
         posts = payload.get("feed", {}).get("data", [])
         next_api = payload.get("feed", {}).get("paging", {}).get("next")
@@ -195,11 +213,19 @@ class FacebookClient:
             "next_api": next_api,
         }
 
-    def get_posts_from_next_api(self, next_api: str, account_cookies: str, proxies: dict = None):
+    def get_posts_from_next_api(
+        self,
+        next_api: str,
+        account_cookies: str,
+        proxies: dict = None,
+        stop_callback=None,
+    ):
         """
         Lấy trang tiếp theo từ paging URL của Facebook Graph API.
         """
-        time.sleep(5)
+        if not _sleep_with_stop(5, stop_callback):
+            logger.info("Stop requested before fetching next_api")
+            return {"posts": [], "next_api": None, "stopped": True}
         if not next_api:
             logger.debug("Skipping next_api fetch because next_api is empty")
             return {"posts": [], "next_api": None}

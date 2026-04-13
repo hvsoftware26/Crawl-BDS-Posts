@@ -148,7 +148,10 @@ class GroupService:
             account_token=self.account_token,
             account_cookies=self.account_cookies,
             proxies=self.proxies,
+            stop_callback=self.stop_callback,
         )
+        if not response or response.get("stopped"):
+            return
 
         while True:
             page_posts = nomalize_post(response.get("posts", []),self.max_length_text, stop_callback=self.stop_callback)
@@ -205,7 +208,10 @@ class GroupService:
                 next_api=next_api,
                 account_cookies=self.account_cookies,
                 proxies=self.proxies,
+                stop_callback=self.stop_callback,
             )
+            if not response or response.get("stopped"):
+                return
             page_number += 1
 
         logger.info(

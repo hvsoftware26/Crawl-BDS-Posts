@@ -35,6 +35,7 @@ env/
 .DS_Store
 
 # Project specific
+Profile-Chrome/
 data/app.db
 logs/
 .env
