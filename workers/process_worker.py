@@ -66,15 +66,13 @@ class Worker_Handle(QThread):
     # =========================
     def stop(self):
         self._stop_requested = True
-        self.log_row("Đang yêu cầu dừng worker...")
+        self.log_row("Đang yêu cầu dừng...")
 
         try:
             if self.page:
                 self.page.close()
         except Exception:
             pass
-
-        self.close()
 
     def is_stop_requested(self) -> bool:
         return self._stop_requested
@@ -365,8 +363,13 @@ class Worker_Handle(QThread):
 
                 self._start_browser()
 
+                if self._stop_requested:
+                    return None, None
+
                 self.log_row(f"Truy cập Facebook (lần {browser_attempt})")
                 if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+                    if self._stop_requested:
+                        return None, None
                     raise Exception("Không vào được Facebook")
 
                 if not self.sleep_with_stop(random.uniform(2, 4)):
@@ -374,94 +377,97 @@ class Worker_Handle(QThread):
 
                 self.log_row("Đang kiểm tra tài khoản")
                 if not self.is_logged_in():
-                    self.log_row("Đang kiểm tra tài khoản")
-                    if not self.is_logged_in():
-                        self.log_row("Tài khoản bị đăng xuất")
-                        count = 0
-                        relogin_success = False
+                    self.log_row("Tài khoản bị đăng xuất")
+                    count = 0
+                    relogin_success = False
 
-                        while count < 5 and not self.is_logged_in():
-                            count += 1
-                            self.log_row(f"Thử đăng nhập lại (lần {count})")
-
-                            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
-                                self.log_row("Không vào được Facebook")
-                                continue
-
-                            try:
-                                # Nút "Tiếp tục"
-                                self.page.evaluate("""
-                                () => {
-                                    const el = [...document.querySelectorAll("span")]
-                                        .find(e => e.innerText.trim() === "Tiếp tục");
-
-                                    if (el) {
-                                        el.click();
-                                        return "clicked";
-                                    }
-                                    return "not_found";
-                                }
-                                """)
-                                time.sleep(4)
-                                # Ô password
-                                self.page.evaluate(
-                                    """(password) => {
-                                        const input = document.querySelector('input[name="pass"]');
-                                        if (!input) return "not_found";
-
-                                        const nativeSetter = Object.getOwnPropertyDescriptor(
-                                            HTMLInputElement.prototype,
-                                            "value"
-                                        ).set;
-
-                                        input.focus();
-                                        nativeSetter.call(input, password);
-                                        input.dispatchEvent(new Event("input", { bubbles: true }));
-                                        input.dispatchEvent(new Event("change", { bubbles: true }));
-                                        input.blur();
-
-                                        return "filled";
-                                    }""",
-                                    self.task.password
-                                )
-
-                                time.sleep(4)
-
-                                # Nút "Đăng nhập"
-                                self.page.evaluate("""
-                                () => {
-                                    const spans = [...document.querySelectorAll("span")];
-
-                                    const btn = spans.find(el =>
-                                        el.innerText.trim() === "Đăng nhập" &&
-                                        el.closest('div[role="button"]')
-                                    );
-
-                                    if (!btn) return "not_found";
-
-                                    btn.closest('div[role="button"]').click();
-                                    return "clicked";
-                                }
-                                """)
-
-                                if not self.sleep_with_stop(3):
-                                    return None, None
-
-                                if self.is_logged_in():
-                                    relogin_success = True
-                                    self.log_row("Đăng nhập lại thành công")
-                                    break
-
-                                self.log_row("Đăng nhập lại chưa thành công, sẽ thử lại")
-
-                            except Exception as e:
-                                logger.error(f"[Row {self.row}] Lỗi quá trình đăng nhập lại lần {count}: {e}")
-                                continue
-
-                        if not relogin_success:
-                            self.log_row("Đăng nhập lại thất bại sau 3 lần thử")
+                    while count < 5 and not self.is_logged_in():
+                        if self._stop_requested:
                             return None, None
 
+                        count += 1
+                        self.log_row(f"Thử đăng nhập lại (lần {count})")
+
+                        if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+                            if self._stop_requested:
+                                return None, None
+                            self.log_row("Không vào được Facebook")
+                            continue
+
+                        try:
+                            self.page.evaluate("""
+                            () => {
+                                const el = [...document.querySelectorAll("span")]
+                                    .find(e => e.innerText.trim() === "Tiếp tục");
+                                if (el) {
+                                    el.click();
+                                    return "clicked";
+                                }
+                                return "not_found";
+                            }
+                            """)
+
+                            if not self.sleep_with_stop(4):
+                                return None, None
+
+                            self.page.evaluate(
+                                """(password) => {
+                                    const input = document.querySelector('input[name="pass"]');
+                                    if (!input) return "not_found";
+
+                                    const nativeSetter = Object.getOwnPropertyDescriptor(
+                                        HTMLInputElement.prototype,
+                                        "value"
+                                    ).set;
+
+                                    input.focus();
+                                    nativeSetter.call(input, password);
+                                    input.dispatchEvent(new Event("input", { bubbles: true }));
+                                    input.dispatchEvent(new Event("change", { bubbles: true }));
+                                    input.blur();
+
+                                    return "filled";
+                                }""",
+                                self.task.password
+                            )
+
+                            if not self.sleep_with_stop(4):
+                                return None, None
+
+                            self.page.evaluate("""
+                            () => {
+                                const spans = [...document.querySelectorAll("span")];
+                                const btn = spans.find(el =>
+                                    el.innerText.trim() === "Đăng nhập" &&
+                                    el.closest('div[role="button"]')
+                                );
+                                if (!btn) return "not_found";
+                                btn.closest('div[role="button"]').click();
+                                return "clicked";
+                            }
+                            """)
+
+                            if not self.sleep_with_stop(3):
+                                return None, None
+
+                            if self.is_logged_in():
+                                relogin_success = True
+                                self.log_row("Đăng nhập lại thành công")
+                                break
+
+                            self.log_row("Đăng nhập lại chưa thành công, sẽ thử lại")
+
+                        except Exception as e:
+                            if self._stop_requested:
+                                return None, None
+                            logger.error(f"[Row {self.row}] Lỗi quá trình đăng nhập lại lần {count}: {e}")
+                            continue
+
+                    if not relogin_success:
+                        return None, None
+
+                if self._stop_requested:
+                    return None, None
 
                 self.log_row("Tài khoản đã đăng nhập")
                 self.log_row("Truy cập Business Location")
@@ -470,28 +476,25 @@ class Worker_Handle(QThread):
                     "https://business.facebook.com/business_locations/",
                     wait_until="domcontentloaded"
                 ):
+                    if self._stop_requested:
+                        return None, None
                     raise Exception("Không vào được Business Location")
 
                 if not self.sleep_with_stop(3):
                     return None, None
 
                 if not self.handle_2fa_if_present():
+                    if self._stop_requested:
+                        return None, None
                     raise Exception("Xử lý 2FA thất bại")
 
-                # =========================
-                # Retry riêng phần lấy cookie/token
-                # Không đóng browser, không login lại từ đầu
-                # =========================
                 for capture_attempt in range(1, capture_retry + 1):
                     if self._stop_requested:
                         return None, None
 
                     try:
-                        self.log_row(
-                            f"Thử lấy cookie/token lần {capture_attempt}/{capture_retry}"
-                        )
+                        self.log_row(f"Thử lấy cookie/token lần {capture_attempt}/{capture_retry}")
 
-                        # reset dữ liệu capture mỗi lần thử
                         self.cookie_raw = None
                         self.eaag_token = None
                         self.request_captured = False
@@ -507,6 +510,8 @@ class Worker_Handle(QThread):
                             "https://business.facebook.com/business_locations/",
                             wait_until="domcontentloaded"
                         ):
+                            if self._stop_requested:
+                                return None, None
                             raise Exception("Không tải lại được Business Location")
 
                         if not self.sleep_with_stop(5):
@@ -520,12 +525,6 @@ class Worker_Handle(QThread):
                         if not self.cookie_raw:
                             self.cookie_raw = self.get_cookie_raw()
 
-                        if self.cookie_raw:
-                            logger.info(f"[Row {self.row}] Cookie raw: {self.cookie_raw}")
-
-                        if self.eaag_token:
-                            logger.info(f"[Row {self.row}] EAAG token: {self.eaag_token}")
-
                         if self.cookie_raw and self.eaag_token:
                             AccountDB(None).update_cookie_token_by_path(
                                 path_profile=self.task.path_chrome,
@@ -536,11 +535,6 @@ class Worker_Handle(QThread):
                             return self.cookie_raw, self.eaag_token
 
                         self.log_row("Chưa lấy đủ cookie/token, sẽ thử lại")
-                        logger.warning(
-                            f"[Row {self.row}] Capture attempt {capture_attempt} failed: "
-                            f"cookie={'yes' if self.cookie_raw else 'no'}, "
-                            f"token={'yes' if self.eaag_token else 'no'}"
-                        )
 
                         if capture_attempt < capture_retry:
                             if not self.sleep_with_stop(2):
@@ -548,6 +542,8 @@ class Worker_Handle(QThread):
                             continue
 
                     except Exception as capture_error:
+                        if self._stop_requested:
+                            return None, None
                         logger.exception(
                             f"[Row {self.row}] Lỗi lấy cookie/token lần {capture_attempt}: {capture_error}"
                         )
@@ -558,27 +554,36 @@ class Worker_Handle(QThread):
                                 return None, None
                             continue
 
-                # Nếu vào đây nghĩa là đã thử capture nhiều lần nhưng vẫn fail
                 raise Exception("Lấy cookie và token thất bại sau nhiều lần thử trong cùng phiên Chrome")
 
             except InterruptedError:
                 return None, None
 
             except PlaywrightTimeoutError as e:
+                if self._stop_requested:
+                    return None, None
                 logger.exception(f"[Row {self.row}] Timeout Playwright lần {browser_attempt}: {e}")
                 self.log_row(f"Timeout lần {browser_attempt}: {e}")
 
             except Exception as e:
+                if self._stop_requested:
+                    return None, None
                 logger.exception(f"[Row {self.row}] Lỗi lần {browser_attempt}: {e}")
                 self.log_row(f"Lỗi lần {browser_attempt}: {e}")
 
             finally:
                 self.close()
 
+            if self._stop_requested:
+                return None, None
+
             if browser_attempt < browser_retry:
                 self.log_row("Thử mở lại trình duyệt và đăng nhập lại...")
                 if not self.sleep_with_stop(3):
                     return None, None
+
+        if self._stop_requested:
+            return None, None
 
         self.log_row("Lấy cookie và token thất bại sau nhiều lần thử")
         return None, None
@@ -607,6 +612,7 @@ class Worker_Handle(QThread):
             progress_callback=self.log_interaction,
             status_callback=self.log_row,
             post_callback=self.log_post,
+            stop_callback=self.is_stop_requested,
         )
 
         logger.info("Bắt đầu scan group=%s", total_groups)

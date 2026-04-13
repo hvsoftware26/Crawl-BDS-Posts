@@ -26,6 +26,7 @@ class ScanGroups:
         progress_callback=None,
         status_callback=None,
         post_callback=None,
+        stop_callback=None,
     ):
         self.groups_list = groups_list
         self.delay = delay
@@ -41,6 +42,7 @@ class ScanGroups:
         self.progress_callback = progress_callback
         self.status_callback = status_callback
         self.post_callback = post_callback
+        self.stop_callback = stop_callback
 
         logger.debug(
             "Initialized ScanGroups worker: groups=%s delay=%s keywords=%s has_proxies=%s has_api_key=%s",
@@ -71,24 +73,24 @@ class ScanGroups:
                 group_summary.get("group_id"),
             )
             return
-        if send_type == 0:
-            message_summary = (
-                f"Nhóm: https://www.facebook.com/{group_summary.get('group_id')}\n"
-                f"Số bài đã phân tích: {len(valid_posts)}\n"
-                "=======================================\n"
-            )
-        else:
-            message_summary = (
-                f">>>KẾT QUẢ SAU 1 CHU KỲ<<< "
-                f"Số bài đã phân tích: {len(valid_posts)}\n"
-                "=======================================\n"
-            )
+        # if send_type == 0:
+        #     message_summary = (
+        #         f"Nhóm: https://www.facebook.com/{group_summary.get('group_id')}\n"
+        #         f"Số bài đã phân tích: {len(valid_posts)}\n"
+        #         "=======================================\n"
+        #     )
+        # else:
+        #     message_summary = (
+        #         f">>>KẾT QUẢ SAU 1 CHU KỲ<<< "
+        #         f"Số bài đã phân tích: {len(valid_posts)}\n"
+        #         "=======================================\n"
+        #     )
         ScanGroups.total_posts_scanned += len(valid_posts)
 
         self.post_callback(ScanGroups.total_posts_scanned)
 
         try:
-            send_message(message_summary, self.token_tele, self.idchat)
+            # send_message(message_summary, self.token_tele, self.idchat)
             logger.info("Sent Telegram summary for group_id=%s", group_summary.get("group_id"))
         except Exception as e:
             logger.exception("Failed to send Telegram message: %s", e)
@@ -104,11 +106,24 @@ class ScanGroups:
             return
 
         try:
+            if send_type == 0:
+                caption = (
+                    f"📌 <b>KẾT QUẢ NHÓM</b>\n\n"
+                    f"🔗 <b>Link nhóm:</b> {group_summary.get('group_id')}\n"
+                    f"✅ <b>Số bài phù hợp:</b> {len(valid_posts)}\n"
+                    f"📎 <b>Tệp đính kèm:</b> file Excel kết quả"
+                )
+            else:
+                caption = (
+                    f"📊 <b>KẾT QUẢ SAU 1 CHU KỲ</b>\n\n"
+                    f"📎 <b>Tệp đính kèm:</b> file Excel kết quả"
+                )
+
             send_document(
                 file_path=excel_file_path,
                 token_tele=self.token_tele,
                 idchat=self.idchat,
-                caption=f">>> File kết quả của Group {group_summary.get('group_id')} <<<" if send_type == 0 else f">>> File kết quả của các groups <<<",
+                caption=caption,
             )
             logger.info("Sent Telegram Excel report for group_id=%s", group_summary.get("group_id"))
             self.status_callback(f"Đã gửi thông báo về Telegram")
@@ -133,6 +148,7 @@ class ScanGroups:
             status_callback = self.status_callback,
             post_callback = self.post_callback,
             progress_callback = self.progress_callback,
+            stop_callback = self.stop_callback,
         )
         posts_status = []
         group_summaries = []

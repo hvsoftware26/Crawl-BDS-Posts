@@ -10,7 +10,7 @@ class Info_data:
     account_name: str
     path_chrome: str
     proxy: str
-    emjuail: str
+    email: str
     password: str
     twofa: str
     cookie: str

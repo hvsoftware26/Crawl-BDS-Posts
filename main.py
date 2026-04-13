@@ -1,17 +1,70 @@
 # Main GUI
-import sys, os, requests, json
+import sys, os, requests, json, shutil
 from typing import List
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QThread, Qt
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableWidgetItem, QMessageBox, QFileDialog,
     QMenu, QHBoxLayout, QWidget, QCheckBox, QDialog,
 )
-
+from playwright.sync_api import sync_playwright
 from services.sql_query_service import AccountDB
 from resources.ui.gui import MultiProfileDialog, Ui_MainWindow, create_application
 from services.ai_service import OpenAIService
 from models.account import Info_data
 from workers.process_worker import Worker_Handle
+
+
+from PyQt5.QtCore import QThread
+from playwright.sync_api import sync_playwright
+
+
+class CREATE_PROFILE(QThread):
+    def __init__(self, path_chrome: str, headless: bool):
+        super().__init__()
+        self.path_chrome = path_chrome
+        self.headless = headless
+
+    def run(self):
+        self.create_profile(self.path_chrome, self.headless)
+
+    @staticmethod
+    def create_profile(path_chrome: str, headless: bool):
+        context = None
+
+        try:
+            with sync_playwright() as p:
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=path_chrome,
+                    headless=headless,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"],
+                )
+
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto("https://www.facebook.com/", wait_until="load")
+
+                # Headless thì chạy xong đóng luôn
+                if headless:
+                    return
+
+                # Không headless thì giữ Chrome mở cho tới khi user bấm X
+                while True:
+                    try:
+                        if len(context.pages) == 0:
+                            break
+                        context.pages[0].wait_for_timeout(1000)
+                    except Exception:
+                        break
+
+        except Exception as e:
+            print("❌ Lỗi khi mở Chrome:", e)
+
+        finally:
+            try:
+                if context:
+                    context.close()
+                    print("🧹 Đã đóng Chrome")
+            except Exception as e:
+                print("⚠️ Lỗi khi đóng Chrome:", e)
 
 
 class MainWindow(QMainWindow):
@@ -194,6 +247,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    
     def open_profile_dialog(self):
         dialog = MultiProfileDialog(self)
         if dialog.exec_() != QDialog.Accepted:
@@ -205,20 +259,26 @@ class MainWindow(QMainWindow):
             try:
                 count_element = line.split('|')
                 if radio_check:
+                    if len(count_element) != 4:
+                        QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
+                        return
+                    account_name, email, password, twofa = count_element
+                    proxy = "Không"
+                    path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
+                    create_profile = CREATE_PROFILE(path_chrome, True)
+                    create_profile.start()
+                else:
                     if len(count_element) != 5:
                         QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
                         return
-                    account_name, path_chrome, email, password, twofa = count_element
-                    proxy = "Không"
-                else:
-                    if len(count_element) != 6:
-                        QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
-                        return
-                    account_name, path_chrome, proxy, email, password, twofa = count_element
+                    account_name, proxy, email, password, twofa = count_element
+                    path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
+                    create_profile = CREATE_PROFILE(path_chrome, True)
+                    create_profile.start()
             except Exception:
                 QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
                 return
-
+            print(path_chrome)
             AccountDB(None).create_account(
                 account_name=account_name,
                 path_chrome=path_chrome,
@@ -391,30 +451,31 @@ class MainWindow(QMainWindow):
         return True
 
     def delete_selected_rows(self):
-        path_chrome_list = []
+        row_del_list = []
         for row in range(self.uic.table.rowCount()):
             item = self.uic.table.item(row, 0)
             if item and item.checkState() == Qt.Checked:
                 path_chrome = self.uic.table.item(row, 2).text()
                 get_id = AccountDB(None).find_id_from_path_chrome(path_chrome)
-                path_chrome_list.append(get_id)
+                row_del_list.append(get_id)
 
-        if not path_chrome_list:
+        if not row_del_list:
             QMessageBox.warning(self, "Thông báo", "Chưa có profiles nào được chọn!")
             return
 
         delete_accept = QMessageBox.question(
             self,
             'Xác nhận',
-            f'Xác nhận xóa {len(path_chrome_list)} profiles ?',
+            f'Xác nhận xóa {len(row_del_list)} profiles ?',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
 
         if delete_accept == QMessageBox.Yes:
-            for row in reversed(path_chrome_list):
+            for row in reversed(row_del_list):
                 AccountDB(None).delete_account(row)
-            self.append_log(f"Đã xóa {len(path_chrome_list)} profiles.")
+                shutil.rmtree(os.path.join(os.getcwd(),"Profile-Chrome",path_chrome))
+            self.append_log(f"Đã xóa {len(row_del_list)} profiles.")
 
         self.load_table()
 
@@ -447,12 +508,12 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        copy_path_ = menu.addAction("📋 Copy path chrome")
-        copy_proxy = menu.addAction("🌐 Copy proxy")
+        copy_path_ = menu.addAction("📋 Copy đường dẫn chrome")
+        copy_proxy = menu.addAction("🌍 Copy proxy (tài nguyên)")
         copy_info_account = menu.addAction("📧 Copy mail|pass|2FA")
-        copy_token = menu.addAction("🔑 Copy token")
-        copy_cookie = menu.addAction("🍪 Copy cookie")
-        check_live_die = menu.addAction("✅ Check Live / Die")
+        copy_token = menu.addAction("🔑 Copy token (tài nguyên)")
+        copy_cookie = menu.addAction("🍪 Copy cookie (tài nguyên)")
+        open_chrome = menu.addAction("🌐 Mở Chrome / Xem Chrome")
 
         selected_action = menu.exec(self.uic.table.viewport().mapToGlobal(pos))
         if selected_action == copy_path_:
@@ -465,8 +526,8 @@ class MainWindow(QMainWindow):
             self.copy_token()
         elif selected_action == copy_cookie:
             self.copy_cookie()
-        elif selected_action == check_live_die:
-            self.check_live_die()
+        elif selected_action == open_chrome:
+            self.open_chrome()
 
     def copy_path(self):
         checked_paths = []
@@ -476,10 +537,10 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_full_path_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy path chrome.')
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy đường dẫn chrome.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} path chrome.')
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} đường dẫ chrome.')
 
     def copy_proxy(self):
         checked_paths = []
@@ -533,44 +594,24 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText('\n'.join(checked_paths))
         QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} cookie.')
 
-    def api_fb_check(self, cookie, token):
-        if cookie == '' or token == '':
-            return "Unk"
-        try:
-            headers = {'cookie': cookie}
-            params = {'fields': 'id,name', 'access_token': token}
-            requests.get('https://graph.facebook.com/v21.0/me', params=params, headers=headers).json()['name']
-            return True
-        except Exception:
-            return False
 
-    def check_live_die(self):
+    def open_chrome(self):
         checked_paths = []
         for row in range(self.uic.table.rowCount()):
             item = self.uic.table.item(row, 0)
             if item and item.checkState() == Qt.Checked:
                 profile_name = self.uic.table.item(row, 2).text()
-                check_live = self.api_fb_check(
-                    AccountDB(None).find_cookie_from_path_chrome(profile_name),
-                    AccountDB(None).find_token_from_path_chrome(profile_name)
-                )
-                checked_paths.append(check_live)
-
-                if check_live is True:
-                    item_status = QTableWidgetItem("Live")
-                elif check_live == "Unk":
-                    item_status = QTableWidgetItem("Thiếu cookie hoặc token")
-                else:
-                    item_status = QTableWidgetItem("Die")
-
-                item_status.setTextAlignment(Qt.AlignCenter)
-                self.uic.table.setItem(row, 5, item_status)
+                full_path = AccountDB(None).find_full_path_from_path_chrome(profile_name)
+                checked_paths.append(full_path)
 
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để check live die.')
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để mở chrome.')
             return
+        
+        self.view_chrome = CREATE_PROFILE(checked_paths[0], False)
+        self.view_chrome.start()
 
-        QMessageBox.information(self, 'Thông báo', f'Đã check live die {len(checked_paths)} tài khoản.')
+        # QMessageBox.information(self, 'Thông báo', f'Đã check live die {len(checked_paths)} tài khoản.')
 
     def build_data(self):
         tasks = []
@@ -637,7 +678,7 @@ class MainWindow(QMainWindow):
                     account_name=account_name or "",
                     path_chrome=path_profile or "",
                     proxy=proxy or "",
-                    emjuail=email or "",
+                    email=email or "",
                     password=password or "",
                     twofa=twofa or "",
                     cookie=cookie or "",
@@ -669,7 +710,4 @@ def main():
 
 
 if __name__ == "__main__":
-    key = requests.get("https://raw.githubusercontent.com/hvsoftware26/Crawl-BDS-Posts/refs/heads/main/key.txt?token=GHSAT0AAAAAADZR5VEM3L2A5F7M3SPGZDO22O3HA2A").text.strip()
-    if key != "HVSOFTWARƯ":
-        open("KEY KÍCH HOẠT.txt", "w", encoding="utf-8").write('VUI LÒNG NHẬP KEY KÍCH HOẠT')
     main()

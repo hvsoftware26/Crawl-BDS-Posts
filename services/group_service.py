@@ -30,6 +30,7 @@ class GroupService:
         progress_callback=None,
         status_callback=None,
         post_callback=None,
+        stop_callback=None,
     ):
         self.facebook_client = FacebookClient(session=None) 
         self.groups_list = groups_list
@@ -44,6 +45,7 @@ class GroupService:
         self.progress_callback = progress_callback
         self.status_callback = status_callback
         self.post_callback = post_callback
+        self.stop_callback = stop_callback
         logger.debug(
             "Initialized GroupService: groups=%s delay_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
             len(groups_list or []),
@@ -54,6 +56,13 @@ class GroupService:
             bool(proxies),
             bool(API_KEY),
         )
+
+    def sleep_with_stop(self, seconds: float):
+        for _ in range(int(seconds * 10)):
+            if hasattr(self, "stop_callback") and self.stop_callback and self.stop_callback():
+                return False
+            time.sleep(0.1)
+        return True
 
     def _filter_recent_posts(self, posts: list[dict], reference_time: datetime):
         recent_posts = [
@@ -132,7 +141,8 @@ class GroupService:
             self.delay_next_run,
         )
         self.status_callback('Bắt đầu thu thập bài viết')
-        time.sleep(1)
+        if not self.sleep_with_stop(1):
+            return
         response = self.facebook_client.get_posts_from_group(
             group_id=group_id,
             account_token=self.account_token,
@@ -141,7 +151,7 @@ class GroupService:
         )
 
         while True:
-            page_posts = nomalize_post(response.get("posts", []),self.max_length_text)
+            page_posts = nomalize_post(response.get("posts", []),self.max_length_text, stop_callback=self.stop_callback)
             recent_posts = self._filter_recent_posts(page_posts, reference_time)
             added_recent_posts = self._extend_unique_posts(
                 all_recent_posts,
@@ -164,7 +174,8 @@ class GroupService:
                 consecutive_pages_without_new_posts,
             )
             self.status_callback(f"Đã thu thập {len(all_recent_posts)} bài viết gần đây")
-            time.sleep(1)
+            if not self.sleep_with_stop(1):
+                return
 
             if consecutive_pages_without_new_posts >= 3:
                 logger.info(
@@ -174,7 +185,8 @@ class GroupService:
                     consecutive_pages_without_new_posts,
                 )
                 self.status_callback("Không còn bài viết mới gần đây, dừng thu thập")
-                time.sleep(1)
+                if not self.sleep_with_stop(1):
+                    return
                 break
 
             next_api = response.get("next_api")
@@ -185,7 +197,8 @@ class GroupService:
                     page_number,
                 )
                 self.status_callback("Đã thu thập hết bài viết gần đây")
-                time.sleep(1)
+                if not self.sleep_with_stop(1):
+                    return
                 break
 
             response = self.facebook_client.get_posts_from_next_api(
@@ -202,7 +215,8 @@ class GroupService:
             page_number,
         )
         self.status_callback(f"Hoàn thành thu thập bài viết gần đây: {len(all_recent_posts)} bài viết")
-        time.sleep(1)
+        if not self.sleep_with_stop(1):
+            return
         return {
             "group_id": group_id,
             "total_posts": len(all_recent_posts),
@@ -217,16 +231,19 @@ class GroupService:
             bool(self.API_KEY),
         )
         self.status_callback("Lọc bài viết theo từ khóa")
-        time.sleep(1)
+        if not self.sleep_with_stop(1):
+            return
         keyword_filtered_posts = rm_non_keywords_posts(
             posts,
             self.keywords,
             status_callback = self.status_callback,
+            stop_callback = self.stop_callback,
         )
         if not keyword_filtered_posts:
             logger.info("No posts left after keyword filtering")
             self.status_callback("Không có bài viết sau khi lọc từ khóa")
-            time.sleep(1)
+            if not self.sleep_with_stop(1):
+                return
             return []
 
         if not self.API_KEY:
@@ -235,7 +252,8 @@ class GroupService:
                 len(keyword_filtered_posts),
             )
             self.status_callback("Không có API Key, bỏ qua lọc")
-            time.sleep(1)
+            if not self.sleep_with_stop(1):
+                return
             return keyword_filtered_posts
 
         ai_filtered_posts = check_posts_by_AI(
@@ -245,6 +263,7 @@ class GroupService:
             api_key=self.API_KEY,
             model="gpt-5-mini",
             proxies=self.proxies,
+            stop_callback=self.stop_callback,
         )
         logger.info(
             "Completed output filtering: keyword_filtered_posts=%s ai_filtered_posts=%s",
@@ -252,14 +271,18 @@ class GroupService:
             len(ai_filtered_posts),
         )
         self.status_callback(f"Hoàn thành lọc: {len(ai_filtered_posts)} bài viết phù hợp")
-        time.sleep(1)
+        if not self.sleep_with_stop(1):
+            return
         return ai_filtered_posts
 
     def get_posts(self):
         logger.info("Start processing groups: groups_count=%s", len(self.groups_list or []))
         self.status_callback("Bắt đầu xử lý nhóm")
-        time.sleep(1)
+        if not self.sleep_with_stop(1):
+            return
         for index, group_id in enumerate(self.groups_list):
+            if self.stop_callback and self.stop_callback():
+                return
             full_posts = []
             filtered_posts = []
             posts_status = []
@@ -272,18 +295,22 @@ class GroupService:
                 group_id,
             )
             self.status_callback(f"Đang xử lý nhóm {index + 1}/{len(self.groups_list)}")
-            time.sleep(1)
+            if not self.sleep_with_stop(1):
+                return
             self.progress_callback(f"{index + 1}/{len(self.groups_list)}")
 
             try:
                 res_posts = self._collect_recent_posts(group_id)
+                if not res_posts:
+                    return
                 logger.info(
                     "Collected %s recent posts from group %s",
                     res_posts.get("total_posts"),
                     group_id,
                 )
                 self.status_callback(f"Thu thập {res_posts.get('total_posts')} bài viết gần đây")
-                time.sleep(1)
+                if not self.sleep_with_stop(1):
+                    return
 
                 full_posts = res_posts.get("posts", [])
                 filtered_posts = self._filter_posts_for_output(full_posts)
@@ -293,6 +320,7 @@ class GroupService:
                     full_posts=full_posts,
                     filtered_posts=filtered_posts,
                     group_id=res_posts.get("group_id"),
+                    stop_callback = self.stop_callback,
                 )
 
                 logger.info(
@@ -307,7 +335,8 @@ class GroupService:
                         extra={"group_id": group_id},
                     )
                     self.status_callback("Nhóm riêng tư hoặc không có bài viết")
-                    time.sleep(1)
+                    if not self.sleep_with_stop(1):
+                        return
 
                     yield {
                         "group_id": group_id,
@@ -324,12 +353,14 @@ class GroupService:
                             group_id,
                             self.delay_next_run,
                         )
-                        time.sleep(5)
+                        if not self.sleep_with_stop(5):
+                            return
 
                     continue
 
                 self.status_callback(f"Chuẩn bị data cho {len(posts_status)} bài viết")
-                time.sleep(1)
+                if not self.sleep_with_stop(1):
+                    return
 
             except Exception as e:
                 error_message = str(e)
@@ -339,7 +370,8 @@ class GroupService:
                     error_message,
                 )
                 self.status_callback("Lỗi khi xử lý nhóm")
-                time.sleep(1)
+                if not self.sleep_with_stop(1):
+                    return
 
             valid_posts_count = sum(
                 1 for post in posts_status if post.get("status") == 1
@@ -374,9 +406,12 @@ class GroupService:
                     self.delay_next_run,
                 )
                 if len(posts_status) == 0:
-                    time.sleep(5)
+                    if not self.sleep_with_stop(5):
+                        return
                 else:
                     self.status_callback(f"Tạm nghỉ {self.delay_next_run // 60} phút")
-                    time.sleep(1)
-                    time.sleep(self.delay_next_run)
+                    if not self.sleep_with_stop(1):
+                        return
+                    if not self.sleep_with_stop(self.delay_next_run):
+                        return
                         
