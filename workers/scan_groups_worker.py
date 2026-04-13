@@ -51,7 +51,7 @@ class ScanGroups:
             bool(API_KEY),
         )
 
-    def _send_group_report(self, group_summary: dict):
+    def _send_group_report(self, group_summary: dict,send_type:int ):
         valid_posts = [
             post
             for post in (group_summary.get("posts_status") or [])
@@ -71,12 +71,18 @@ class ScanGroups:
                 group_summary.get("group_id"),
             )
             return
-
-        message_summary = (
-            f"Nhóm: https://www.facebook.com/{group_summary.get('group_id')}\n"
-            f"Số bài đã phân tích: {len(valid_posts)}\n"
-            "=======================================\n"
-        )
+        if send_type == 0:
+            message_summary = (
+                f"Nhóm: https://www.facebook.com/{group_summary.get('group_id')}\n"
+                f"Số bài đã phân tích: {len(valid_posts)}\n"
+                "=======================================\n"
+            )
+        else:
+            message_summary = (
+                f">>>KẾT QUẢ SAU 1 CHU KỲ<<< "
+                f"Số bài đã phân tích: {len(valid_posts)}\n"
+                "=======================================\n"
+            )
         ScanGroups.total_posts_scanned += len(valid_posts)
 
         self.post_callback(ScanGroups.total_posts_scanned)
@@ -102,7 +108,7 @@ class ScanGroups:
                 file_path=excel_file_path,
                 token_tele=self.token_tele,
                 idchat=self.idchat,
-                caption=f">>> File kết quả của Group {group_summary.get('group_id')} <<<",
+                caption=f">>> File kết quả của Group {group_summary.get('group_id')} <<<" if send_type == 0 else f">>> File kết quả của các groups <<<",
             )
             logger.info("Sent Telegram Excel report for group_id=%s", group_summary.get("group_id"))
             self.status_callback(f"Đã gửi thông báo về Telegram")
@@ -129,10 +135,11 @@ class ScanGroups:
             progress_callback = self.progress_callback,
         )
         posts_status = []
-
+        group_summaries = []
         for group_summary in group_service.get_posts():
             group_posts_status = group_summary.get("posts_status", [])
-            self._send_group_report(group_summary)
+            group_summaries.extend(group_summary)
+            self._send_group_report(group_summary,send_type = 0)
             posts_status.extend(group_posts_status)
             valid_posts_count = sum(
                 1 for post in group_posts_status if post.get("status") == 1
@@ -147,4 +154,5 @@ class ScanGroups:
                 valid_posts_count,
                 invalid_posts_count,
             )
+        self._send_group_report(group_summary,send_type = 1)
         return posts_status
