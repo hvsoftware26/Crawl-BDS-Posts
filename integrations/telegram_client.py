@@ -45,13 +45,14 @@ def send_message(message, token_tele, idchat):
     }
 
 
-def send_document(file_path, token_tele, idchat, caption=None):
+def send_document(file_path, token_tele, idchat, caption=None, parse_mode="HTML"):
     if not file_path:
         logger.warning("Document path is empty, not sending.")
         return {
             "status": "error",
             "message": "Document path is empty.",
         }
+
     if not token_tele or not idchat:
         logger.warning("Telegram config is missing, not sending document.")
         return {
@@ -59,21 +60,36 @@ def send_document(file_path, token_tele, idchat, caption=None):
             "message": "Telegram config is missing.",
         }
 
-    with open(file_path, "rb") as document:
-        post = requests.post(
-            f"https://api.telegram.org/bot{token_tele}/sendDocument",
-            data={
+    try:
+        with open(file_path, "rb") as document:
+            data = {
                 "chat_id": _build_chat_id(idchat),
                 "caption": caption or "",
-            },
-            files={"document": document},
-            timeout=60,
-        )
+            }
 
-    return {
-        "status": "success" if post.json().get("ok") else "error",
-        "message": "Document sent successfully."
-        if post.json().get("ok")
-        else "Failed to send document.",
-    }
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+
+            post = requests.post(
+                f"https://api.telegram.org/bot{token_tele}/sendDocument",
+                data=data,
+                files={"document": document},
+                timeout=60,
+            )
+
+        result = post.json()
+
+        return {
+            "status": "success" if result.get("ok") else "error",
+            "message": "Document sent successfully."
+            if result.get("ok")
+            else result.get("description", "Failed to send document."),
+        }
+
+    except Exception as e:
+        logger.exception("Failed to send document: %s", e)
+        return {
+            "status": "error",
+            "message": str(e),
+        }
 

@@ -96,8 +96,9 @@ class AccountDB:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
-            row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["id"]
+            row = conn.execute(query, (f"%\\{name_path}%",)).fetchone()
+            print(row)
+            return row[0]
         
     def find_account_name_from_path_chrome(self, name_path: str) -> int:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"

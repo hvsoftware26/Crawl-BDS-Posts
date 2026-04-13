@@ -11,13 +11,14 @@ from utils.time_utils import format_facebook_created_time
 logger = getLogger(__name__)
 DEFAULT_AI_BATCH_SIZE = 20
 
+
 def get_uid_groups(links: str):
     ua = UserAgent()
     list_uids= []
     for link in links:
         list_uids.append(link.split("groups/")[1].split("/")[0])
     return list_uids
-def nomalize_post(posts: list[dict],max_length_text: int = 500):
+def nomalize_post(posts: list[dict],max_length_text: int = 500, stop_callback=None):
     """
     Normalize Facebook posts to a standard format.
     Return: normalized posts list
@@ -29,6 +30,8 @@ def nomalize_post(posts: list[dict],max_length_text: int = 500):
     logger.debug("Normalizing posts: raw_posts_count=%s", len(posts or []))
 
     for post in posts:
+        if stop_callback and stop_callback():
+            return
         post_id = post.get("id")
         if not post_id:
             skipped_without_id += 1
@@ -56,15 +59,27 @@ def nomalize_post(posts: list[dict],max_length_text: int = 500):
     return fixed_posts
 
 
-def rm_non_keywords_posts(posts: list[dict], keywords: list[str], status_callback: str):
+def rm_non_keywords_posts(posts: list[dict], keywords: list[str], status_callback, stop_callback=None):
     """
     Keep only posts that contain at least one keyword.
     """
+
+    def sleep_with_stop(seconds):
+        for _ in range(int(seconds * 10)):
+            if stop_callback and stop_callback():
+                return False
+            time.sleep(0.1)
+        return True
+
     normalized_keywords = [
         keyword.strip().lower()
         for keyword in (keywords or [])
         if isinstance(keyword, str) and keyword.strip()
     ]
+
+    # 🔥 check stop sớm
+    if stop_callback and stop_callback():
+        return []
 
     if not normalized_keywords:
         logger.info(
@@ -72,50 +87,58 @@ def rm_non_keywords_posts(posts: list[dict], keywords: list[str], status_callbac
             len(posts or []),
         )
 
-        status_callback("Bỏ qua bước lọc từ khóa vì danh sách từ khóa trống. Tổng bài viết: %s" % len(posts or []))
-        time.sleep(1)
+        status_callback(
+            "Bỏ qua bước lọc từ khóa vì danh sách từ khóa trống. Tổng bài viết: %s"
+            % len(posts or [])
+        )
+
+        # 🔥 thay sleep
+        if not sleep_with_stop(1):
+            return []
+
         return posts.copy()
-
-    filtered_posts = []
-    for post in posts:
-        message = (post.get("message") or "").lower()
-        if any(keyword not in message for keyword in normalized_keywords):
-            filtered_posts.append(post)
-
-    logger.info(
-        "Keyword filter completed: input_posts=%s output_posts=%s keywords=%s",
-        len(posts or []),
-        len(filtered_posts),
-        normalized_keywords,
-    )
-    status_callback("Hoàn thành lọc từ khóa: tổng bài viết=%s bài viết hợp lệ=%s từ khóa=%s" % (len(posts or []), len(filtered_posts), normalized_keywords))
-    time.sleep(1)
-    return filtered_posts
 
 
 def check_posts_by_AI(
-    status_callback: str,
+    status_callback,
     posts: list[Dict[str, Any]],
     prompt: Union[str, Dict[str, Any]],
     api_key: str,
     model: Optional[str] = None,
     proxies: Optional[Dict[str, str]] = None,
     batch_size: int = DEFAULT_AI_BATCH_SIZE,
-    
+    stop_callback=None,
 ):
+    def sleep_with_stop(seconds: float) -> bool:
+        for _ in range(int(seconds * 10)):
+            if stop_callback and stop_callback():
+                return False
+            time.sleep(0.1)
+        return True
+
     candidate_posts = []
     skipped_empty_messages = 0
+
+    if stop_callback and stop_callback():
+        return []
+
     logger.info(
         "Starting AI filter for posts: posts_count=%s model=%s batch_size=%s",
         len(posts or []),
         model or "default",
         batch_size,
     )
-    status_callback("Bắt đầu kiểm tra AI cho %s bài viết với model %s" % (len(posts or []), model or "default"))
-    time.sleep(1)
-
+    status_callback(
+        "Bắt đầu kiểm tra AI cho %s bài viết với model %s"
+        % (len(posts or []), model or "default")
+    )
+    if not sleep_with_stop(1):
+        return []
 
     for post in (posts or []):
+        if stop_callback and stop_callback():
+            return []
+
         message = (post or {}).get("message")
         if not isinstance(message, str) or not message.strip():
             skipped_empty_messages += 1
@@ -123,7 +146,10 @@ def check_posts_by_AI(
                 "Skipping post in batch AI filter because message is empty: post_id=%s",
                 (post or {}).get("id"),
             )
-            status_callback("Bỏ qua bài viết vì không có nội dung: post_id=%s" % (post or {}).get("id"))
+            status_callback(
+                "Bỏ qua bài viết vì không có nội dung: post_id=%s"
+                % (post or {}).get("id")
+            )
             continue
 
         candidate_posts.append(post)
@@ -139,9 +165,13 @@ def check_posts_by_AI(
     filtered_posts = []
 
     for batch_index in range(total_batches):
+        if stop_callback and stop_callback():
+            return filtered_posts
+
         start_index = batch_index * batch_size
         end_index = start_index + batch_size
         batch_posts = candidate_posts[start_index:end_index]
+
         logger.info(
             "Sending AI batch %s/%s: batch_posts=%s start_index=%s end_index=%s",
             batch_index + 1,
@@ -150,8 +180,16 @@ def check_posts_by_AI(
             start_index,
             min(end_index, len(candidate_posts)),
         )
-        status_callback("Đang kiểm tra AI cho batch %s/%s: %s bài viết" % (batch_index + 1, total_batches, len(batch_posts)))
-        time.sleep(1)
+        status_callback(
+            "Đang kiểm tra AI cho batch %s/%s: %s bài viết"
+            % (batch_index + 1, total_batches, len(batch_posts))
+        )
+        if not sleep_with_stop(1):
+            return filtered_posts
+
+        if stop_callback and stop_callback():
+            return filtered_posts
+
         batch_filtered_posts = filter_posts_with_openai(
             posts=batch_posts,
             prompt=prompt,
@@ -159,7 +197,12 @@ def check_posts_by_AI(
             model=model,
             proxies=proxies,
         )
+
+        if stop_callback and stop_callback():
+            return filtered_posts
+
         filtered_posts.extend(batch_filtered_posts)
+
         logger.info(
             "Completed AI batch %s/%s: matched_posts=%s cumulative_matched_posts=%s",
             batch_index + 1,
@@ -167,8 +210,13 @@ def check_posts_by_AI(
             len(batch_filtered_posts),
             len(filtered_posts),
         )
-        status_callback("Hoàn thành AI check batch %s/%s: %s chọn bài viết" % (batch_index + 1, total_batches, len(batch_filtered_posts)))
-        time.sleep(1)
+        status_callback(
+            "Hoàn thành AI check batch %s/%s: %s chọn bài viết"
+            % (batch_index + 1, total_batches, len(batch_filtered_posts))
+        )
+        if not sleep_with_stop(1):
+            return filtered_posts
+
     logger.info(
         "Completed AI filter for posts: input_posts=%s candidate_posts=%s matched_posts=%s skipped_empty_messages=%s total_batches=%s",
         len(posts or []),
@@ -177,17 +225,33 @@ def check_posts_by_AI(
         skipped_empty_messages,
         total_batches,
     )
-    status_callback("Có %s bài viết được chọn, %s bài viết bị bỏ" % (len(filtered_posts), skipped_empty_messages))
-    time.sleep(1)
+    status_callback(
+        "Có %s bài viết được chọn, %s bài viết bị bỏ"
+        % (len(filtered_posts), skipped_empty_messages)
+    )
+    if not sleep_with_stop(1):
+        return filtered_posts
+
     return filtered_posts
 
 
 def build_posts_status(
-    status_callback: str,
+    status_callback,
     full_posts: list[dict],
     filtered_posts: list[dict],
     group_id: str = None,
+    stop_callback=None,
 ):
+    def sleep_with_stop(seconds: float) -> bool:
+        for _ in range(int(seconds * 10)):
+            if stop_callback and stop_callback():
+                return False
+            time.sleep(0.1)
+        return True
+
+    if stop_callback and stop_callback():
+        return []
+
     filtered_post_ids = {
         post.get("id")
         for post in (filtered_posts or [])
@@ -197,6 +261,9 @@ def build_posts_status(
     posts_status = []
 
     for post in (full_posts or []):
+        if stop_callback and stop_callback():
+            return posts_status
+
         post_id = post.get("id")
         if not post_id or post_id in seen_post_ids:
             continue
@@ -212,16 +279,25 @@ def build_posts_status(
             }
         )
 
+    valid_count = sum(1 for post in posts_status if post.get("status") == 1)
+    invalid_count = sum(1 for post in posts_status if post.get("status") == 0)
+
     logger.info(
         "Built posts status list: full_posts=%s filtered_posts=%s output_posts=%s valid_status=%s invalid_status=%s group_id=%s",
         len(full_posts or []),
         len(filtered_posts or []),
         len(posts_status),
-        sum(1 for post in posts_status if post.get("status") == 1),
-        sum(1 for post in posts_status if post.get("status") == 0),
+        valid_count,
+        invalid_count,
         group_id,
     )
-    status_callback("Đã xây dựng trạng thái bài viết: tổng bài viết=%s bài viết hợp lệ=%s bài viết không hợp lệ=%s" % (len(full_posts or []), sum(1 for post in posts_status if post.get("status") == 1), sum(1 for post in posts_status if post.get("status") == 0)))
-    time.sleep(1)
+
+    status_callback(
+        "Đã xây dựng trạng thái bài viết: tổng bài viết=%s bài viết hợp lệ=%s bài viết không hợp lệ=%s"
+        % (len(full_posts or []), valid_count, invalid_count)
+    )
+
+    if not sleep_with_stop(1):
+        return posts_status
 
     return posts_status

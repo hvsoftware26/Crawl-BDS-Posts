@@ -188,6 +188,23 @@ QScrollBar::handle:vertical {
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0;
 }
+QMenu {
+    background: #f8fbff;
+    border: 1px solid #d7e1ef;
+    padding: 2px;
+}
+
+QMenu::item {
+    padding: 9px 18px;
+    border-radius: 8px;
+    margin: 2px 4px;
+    color: #16243b;
+}
+
+QMenu::item:selected {
+    background: #2160ff;
+    color: white;
+}
 """
 
 
@@ -275,9 +292,9 @@ class MultiProfileDialog(QDialog):
         self.editor.setPlaceholderText(
             "Dán danh sách profile tại đây...\n"
             "Dùng proxy chọn chế độ Profile Chrome-Proxy:\n"
-            "Tên1-Tên2|Profile_chrome|proxy|email|password\n"
+            "Tên tài khoản|proxy|email|password|2FA\n"
             "Không dùng proxy chọn chế độ Profile Chrome:\n"
-            "Tên1-Tên2|Profile_chrome|email|password"
+            "Tên tài khoản|email|password|2FA"
         )
         self.editor.setMinimumHeight(180)
         top_layout.addWidget(self.editor)
@@ -303,13 +320,13 @@ class MultiProfileDialog(QDialog):
             text = (
                 "Dán nhiều dòng profile vào đây. Mỗi dòng là 1 profile.\n"
                 "Ví dụ:\n"
-                "Tên tài khoản|C:/Users/profile_1|127.0.0.1:8000:user:pass|example@gmail.com|Nohope1111@@"
+                "Tên tài khoản|127.0.0.1:8000:user:pass|example@gmail.com|Nohope1111@@|2FA"
             )
         else:
             text = (
                 "Dán nhiều dòng profile vào đây. Mỗi dòng là 1 profile.\n"
                 "Ví dụ:\n"
-                "Tên tài khoản|C:/Users/profile_1|example@gmail.com|Nohope1111@@"
+                "Tên tài khoản|example@gmail.com|Nohope1111@@|2FA"
             )
         self.help_box.setText(text)
 
@@ -393,28 +410,17 @@ class Ui_MainWindow(object):
         self.controls.setHorizontalSpacing(10)
         self.controls.setVerticalSpacing(10)
 
-        self.lbl_threads = LabelBox("Số luồng")
-        self.spn_threads = NumberBox(1, 500, 1)
-        self.spn_threads.setReadOnly(True)
-        self.spn_threads.setFocusPolicy(Qt.NoFocus)
-
         self.lbl_cycle_hours = LabelBox("Chu kỳ")
         self.spn_cycle_hours = DecimalBox(0.1, 999999.0, 4.0, " tiếng", 1)
 
         self.lb_delay_between_cycles = LabelBox("Delay giữa các chu kỳ: 0 phút", "statsLabel")
         self.lb_delay_between_cycles.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
 
-        self.lbl_delay_cookie = LabelBox("Delay token - cookie")
-        self.spn_delay_cookie = PlaceholderPathEdit("Sau mỗi chu kỳ")
-        self.spn_delay_cookie.setReadOnly(True)
-
         self.lbl_banned_keywords = LabelBox("Keywords Cấm")
         self.edit_banned_keywords = PlaceholderPathEdit("Nhập keyword cấm...")
 
         control_items = [
-            self.lbl_threads, self.spn_threads,
             self.lbl_cycle_hours, self.spn_cycle_hours,
-            self.lbl_delay_cookie, self.spn_delay_cookie,
             self.lbl_banned_keywords, self.edit_banned_keywords,
         ]
         for i, widget in enumerate(control_items):
