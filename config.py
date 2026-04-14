@@ -2,7 +2,33 @@
 import re
 from datetime import datetime, timedelta, timezone
 #setting for Chromium Path
-CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+import winreg
+
+def get_chrome_path_from_registry():
+    reg_paths = [
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    ]
+
+    for reg_path in reg_paths:
+        try:
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                reg_path
+            )
+
+            value, _ = winreg.QueryValueEx(key, "")
+            return value
+
+        except FileNotFoundError:
+            continue
+
+    return None
+
+
+chrome_path = get_chrome_path_from_registry()
+
+CHROME_PATH = chrome_path if chrome_path else r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 #seting for API Facebook
 DEFAULT_HEADERS = {
