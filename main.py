@@ -1,5 +1,6 @@
 # Main GUI
 import sys, os, requests, json, shutil
+from pathlib import Path
 from typing import List
 from PyQt5.QtCore import QThread, Qt
 from PyQt5.QtWidgets import (
@@ -13,6 +14,13 @@ from services.ai_service import OpenAIService
 from models.account import Info_data
 from workers.process_worker import Worker_Handle
 from config import CHROME_PATH
+
+BASE_DIR = Path(__file__).resolve().parent
+PROFILES_DIR = (BASE_DIR / "Profile-Chrome").resolve()
+
+
+def build_profile_path(profile_name: str) -> str:
+    return str((PROFILES_DIR / str(profile_name).strip()).resolve())
 
 
 class CREATE_PROFILE(QThread):
@@ -292,7 +300,7 @@ class MainWindow(QMainWindow):
                         return
                     account_name, email, password, twofa = count_element
                     proxy = "Không"
-                    path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
+                    path_chrome = build_profile_path(email.split('@')[0])
                     create_profile = CREATE_PROFILE(path_chrome, True)
                     self._track_profile_thread(create_profile)
                     create_profile.start()
@@ -301,7 +309,7 @@ class MainWindow(QMainWindow):
                         QMessageBox.warning(self, 'Cảnh báo', 'Đã nhập sai định dạng!')
                         return
                     account_name, proxy, email, password, twofa = count_element
-                    path_chrome = os.getcwd() + '\\Profile-Chrome\\' + email.split('@')[0]
+                    path_chrome = build_profile_path(email.split('@')[0])
                     create_profile = CREATE_PROFILE(path_chrome, True)
                     self._track_profile_thread(create_profile)
                     create_profile.start()
@@ -481,31 +489,36 @@ class MainWindow(QMainWindow):
         return True
 
     def delete_selected_rows(self):
-        row_del_list = []
+        selected_accounts = []
         for row in range(self.uic.table.rowCount()):
             item = self.uic.table.item(row, 0)
             if item and item.checkState() == Qt.Checked:
-                path_chrome = self.uic.table.item(row, 2).text()
-                get_id = AccountDB(None).find_id_from_path_chrome(path_chrome)
-                row_del_list.append(get_id)
+                profile_name = self.uic.table.item(row, 2).text()
+                db = AccountDB(None)
+                account_id = db.find_id_from_path_chrome(profile_name)
+                full_path = db.find_full_path_from_path_chrome(profile_name)
+                selected_accounts.append((account_id, full_path))
 
-        if not row_del_list:
+        if not selected_accounts:
             QMessageBox.warning(self, "Thông báo", "Chưa có profiles nào được chọn!")
             return
 
         delete_accept = QMessageBox.question(
             self,
             'Xác nhận',
-            f'Xác nhận xóa {len(row_del_list)} profiles ?',
+            f'Xác nhận xóa {len(selected_accounts)} profiles ?',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
 
         if delete_accept == QMessageBox.Yes:
-            for row in reversed(row_del_list):
-                AccountDB(None).delete_account(row)
-                shutil.rmtree(os.path.join(os.getcwd(),"Profile-Chrome",path_chrome))
-            self.append_log(f"Đã xóa {len(row_del_list)} profiles.")
+            for account_id, full_path in reversed(selected_accounts):
+                AccountDB(None).delete_account(account_id)
+                try:
+                    shutil.rmtree(full_path)
+                except FileNotFoundError:
+                    pass
+            self.append_log(f"Đã xóa {len(selected_accounts)} profiles.")
 
         self.load_table()
 

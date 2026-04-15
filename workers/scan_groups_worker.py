@@ -1,7 +1,7 @@
 # Scan groups worker thread
 from logging import getLogger
 
-from integrations.telegram_client import send_document, send_message
+from integrations.telegram_client import send_document
 from services.group_service import GroupService
 from utils.excel_utils import build_group_posts_excel
 
@@ -9,7 +9,6 @@ logger = getLogger(__name__)
 
 
 class ScanGroups:
-    total_posts_scanned = 0
     def __init__(
         self,
         groups_list: list[str],
@@ -43,6 +42,7 @@ class ScanGroups:
         self.status_callback = status_callback
         self.post_callback = post_callback
         self.stop_callback = stop_callback
+        self.total_posts_scanned = 0
 
         logger.debug(
             "Initialized ScanGroups worker: groups=%s delay=%s keywords=%s has_proxies=%s has_api_key=%s",
@@ -53,56 +53,47 @@ class ScanGroups:
             bool(API_KEY),
         )
 
-    def _send_group_report(self, group_summary: dict,send_type:int ):
-        valid_posts = [
+    def _extract_valid_posts(self, posts_status: list[dict] | None) -> list[dict]:
+        return [
             post
-            for post in (group_summary.get("posts_status") or [])
+            for post in (posts_status or [])
             if post.get("status") == 1
         ]
 
+    def _send_group_report(self, group_summary: dict, send_type: int):
+        valid_posts = self._extract_valid_posts(group_summary.get("posts_status"))
+        report_id = group_summary.get("group_id")
+
         if not valid_posts:
             logger.info(
-                "Skipping Telegram report because there are no valid posts: group_id=%s",
-                group_summary.get("group_id"),
+                "Skipping Telegram report because there are no valid posts: report_type=%s report_id=%s",
+                "cycle" if send_type == 1 else "group",
+                report_id,
             )
             return
 
         if not self.token_tele or not self.idchat:
             logger.info(
-                "Skipping Telegram report because token_tele or idchat is missing: group_id=%s",
-                group_summary.get("group_id"),
+                "Skipping Telegram report because token_tele or idchat is missing: report_type=%s report_id=%s",
+                "cycle" if send_type == 1 else "group",
+                report_id,
             )
             return
-        # if send_type == 0:
-        #     message_summary = (
-        #         f"Nhóm: https://www.facebook.com/{group_summary.get('group_id')}\n"
-        #         f"Số bài đã phân tích: {len(valid_posts)}\n"
-        #         "=======================================\n"
-        #     )
-        # else:
-        #     message_summary = (
-        #         f">>>KẾT QUẢ SAU 1 CHU KỲ<<< "
-        #         f"Số bài đã phân tích: {len(valid_posts)}\n"
-        #         "=======================================\n"
-        #     )
-        ScanGroups.total_posts_scanned += len(valid_posts)
 
-        self.post_callback(ScanGroups.total_posts_scanned)
-
-        try:
-            # send_message(message_summary, self.token_tele, self.idchat)
-            logger.info("Sent Telegram summary for group_id=%s", group_summary.get("group_id"))
-        except Exception as e:
-            logger.exception("Failed to send Telegram message: %s", e)
+        if send_type == 0:
+            self.total_posts_scanned += len(valid_posts)
+            if self.post_callback:
+                self.post_callback(self.total_posts_scanned)
 
         try:
             excel_file_path = build_group_posts_excel(
-                group_id=group_summary.get("group_id"),
+                group_id=report_id,
                 posts=valid_posts,
+                include_group_column=(send_type == 1),
             )
             logger.info("Excel exported: %s", excel_file_path)
         except Exception as e:
-            logger.exception("Failed to export Excel for group_id=%s: %s", group_summary.get("group_id"), e)
+            logger.exception("Failed to export Excel for report_id=%s: %s", report_id, e)
             return
 
         try:
@@ -114,8 +105,11 @@ class ScanGroups:
                     f"📎 <b>Tệp đính kèm:</b> file Excel kết quả"
                 )
             else:
+                groups_processed = group_summary.get("groups_processed", 0)
                 caption = (
                     f"📊 <b>KẾT QUẢ SAU 1 CHU KỲ</b>\n\n"
+                    f"📚 <b>Số nhóm đã xử lý:</b> {groups_processed}\n"
+                    f"✅ <b>Số bài phù hợp:</b> {len(valid_posts)}\n"
                     f"📎 <b>Tệp đính kèm:</b> file Excel kết quả"
                 )
 
@@ -125,10 +119,15 @@ class ScanGroups:
                 idchat=self.idchat,
                 caption=caption,
             )
-            logger.info("Sent Telegram Excel report for group_id=%s", group_summary.get("group_id"))
+            logger.info(
+                "Sent Telegram Excel report: report_type=%s report_id=%s valid_posts=%s",
+                "cycle" if send_type == 1 else "group",
+                report_id,
+                len(valid_posts),
+            )
             self.status_callback(f"Đã gửi thông báo về Telegram")
         except Exception as e:
-            logger.exception("Failed to send Telegram document for group_id=%s: %s", group_summary.get("group_id"), e)
+            logger.exception("Failed to send Telegram document for report_id=%s: %s", report_id, e)
 
     def get_groups(self):
         logger.info(
@@ -151,12 +150,18 @@ class ScanGroups:
             stop_callback = self.stop_callback,
         )
         posts_status = []
-        group_summaries = []
+        cycle_valid_posts = []
+        processed_groups = 0
+
         for group_summary in group_service.get_posts():
+            processed_groups += 1
             group_posts_status = group_summary.get("posts_status", [])
-            group_summaries.extend(group_summary)
-            self._send_group_report(group_summary,send_type = 0)
+            group_valid_posts = self._extract_valid_posts(group_posts_status)
+
+            cycle_valid_posts.extend(group_valid_posts)
+            self._send_group_report(group_summary, send_type=0)
             posts_status.extend(group_posts_status)
+
             valid_posts_count = sum(
                 1 for post in group_posts_status if post.get("status") == 1
             )
@@ -170,5 +175,15 @@ class ScanGroups:
                 valid_posts_count,
                 invalid_posts_count,
             )
-        self._send_group_report(group_summary,send_type = 1)
+
+        if processed_groups == 0:
+            logger.info("Skipping cycle Telegram report because no groups were processed")
+            return posts_status
+
+        cycle_summary = {
+            "group_id": f"cycle_summary_{processed_groups}_groups",
+            "groups_processed": processed_groups,
+            "posts_status": cycle_valid_posts,
+        }
+        self._send_group_report(cycle_summary, send_type=1)
         return posts_status

@@ -27,7 +27,6 @@ def get_chrome_path_from_registry():
 
 
 chrome_path = get_chrome_path_from_registry()
-
 CHROME_PATH = chrome_path if chrome_path else r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 #seting for API Facebook

@@ -317,7 +317,6 @@ class GroupService:
                 self.status_callback(f"Thu thập {res_posts.get('total_posts')} bài viết gần đây")
                 if not self.sleep_with_stop(1):
                     return
-
                 full_posts = res_posts.get("posts", [])
                 filtered_posts = self._filter_posts_for_output(full_posts)
 

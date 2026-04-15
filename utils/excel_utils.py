@@ -55,7 +55,11 @@ def format_excel_created_time(created_time: str) -> str:
     return str(created_time or "")
 
 
-def build_group_posts_excel(group_id: str, posts: list[dict]) -> Path:
+def build_group_posts_excel(
+    group_id: str,
+    posts: list[dict],
+    include_group_column: bool = False,
+) -> Path:
     export_dir = EXPORTS_DIR / "telegram"
     export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -65,6 +69,8 @@ def build_group_posts_excel(group_id: str, posts: list[dict]) -> Path:
     worksheet.freeze_panes = "A2"
 
     headers = ["Link bài", "Time created", "Message"]
+    if include_group_column:
+        headers = ["Nhóm"] + headers
     header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
     thin_side = Side(style="thin", color="C9D2DB")
     border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
@@ -80,13 +86,14 @@ def build_group_posts_excel(group_id: str, posts: list[dict]) -> Path:
         cell.border = border
 
     for post in posts:
-        worksheet.append(
-            [
-                f"https://www.facebook.com/{post.get('id')}",
-                format_excel_created_time(post.get("created_time")),
-                sanitize_excel_message(post.get("message")),
-            ]
-        )
+        row = [
+            f"https://www.facebook.com/{post.get('id')}",
+            format_excel_created_time(post.get("created_time")),
+            sanitize_excel_message(post.get("message")),
+        ]
+        if include_group_column:
+            row = [str(post.get("group_id") or "")] + row
+        worksheet.append(row)
 
     for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
         for cell in row:
@@ -94,9 +101,15 @@ def build_group_posts_excel(group_id: str, posts: list[dict]) -> Path:
             cell.alignment = wrap_alignment
             cell.border = border
 
-    worksheet.column_dimensions["A"].width = 40
-    worksheet.column_dimensions["B"].width = 22
-    worksheet.column_dimensions["C"].width = 120
+    if include_group_column:
+        worksheet.column_dimensions["A"].width = 45
+        worksheet.column_dimensions["B"].width = 40
+        worksheet.column_dimensions["C"].width = 22
+        worksheet.column_dimensions["D"].width = 120
+    else:
+        worksheet.column_dimensions["A"].width = 40
+        worksheet.column_dimensions["B"].width = 22
+        worksheet.column_dimensions["C"].width = 120
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 

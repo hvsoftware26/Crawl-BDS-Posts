@@ -1,4 +1,4 @@
-import sqlite3, os
+import sqlite3
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 
@@ -9,14 +9,56 @@ class AccountDB:
             db_path = base_dir / "database" / "accounts.db"
         else:
             db_path = Path(db_name)
+            base_dir = db_path.resolve().parent.parent
 
         # ✅ Tạo folder nếu chưa tồn tại
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
+        self.base_dir = base_dir.resolve()
+        self.profile_root = (self.base_dir / "Profile-Chrome").resolve()
         self.db_name = str(db_path)
 
     def _connect(self):
         return sqlite3.connect(self.db_name)
+
+    def _normalize_profile_path_value(self, path_chrome: str) -> str:
+        normalized_input = str(path_chrome or "").strip().strip('"')
+        if not normalized_input:
+            return ""
+
+        candidate = Path(normalized_input)
+        profile_name = candidate.name.strip()
+        if not profile_name:
+            return normalized_input
+
+        if candidate.exists():
+            return str(candidate.resolve())
+
+        resolved_local = (self.profile_root / profile_name).resolve()
+        return str(resolved_local)
+
+    def _rewrite_profile_path(self, old_path: str, new_path: str):
+        if not old_path or not new_path or old_path == new_path:
+            return
+
+        query = "UPDATE accounts SET Path_Chrome = ? WHERE Path_Chrome = ?"
+        with self._connect() as conn:
+            conn.execute(query, (new_path, old_path))
+            conn.commit()
+
+    def _normalize_account_row(self, row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+
+        row_dict = dict(row)
+        original_path = row_dict.get("Path_Chrome") or ""
+        normalized_path = self._normalize_profile_path_value(original_path)
+
+        if normalized_path and normalized_path != original_path:
+            self._rewrite_profile_path(original_path, normalized_path)
+            row_dict["Path_Chrome"] = normalized_path
+
+        return row_dict
 
     def _create_table(self):
         query = """
@@ -90,7 +132,12 @@ class AccountDB:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query).fetchall()
-            return [dict(row) for row in rows]
+            normalized_rows = []
+            for row in rows:
+                row_dict = self._normalize_account_row(row)
+                if row_dict is not None:
+                    normalized_rows.append(row_dict)
+            return normalized_rows
 
     def find_id_from_path_chrome(self, name_path: str) -> int:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
@@ -105,14 +152,16 @@ class AccountDB:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Account_Name"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Account_Name"]
         
     def find_full_path_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Path_Chrome"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Path_Chrome"]
         
     
     def find_info_account_from_path_chrome(self, name_path: str) -> str:
@@ -120,42 +169,47 @@ class AccountDB:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Email"]+"|"+row["Password"]+"|"+row["Twofa"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Email"]+"|"+row_dict["Password"]+"|"+row_dict["Twofa"]
         
     def find_proxy_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Proxy"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Proxy"]
         
     def find_token_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Token"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Token"]
 
     def find_cookie_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Cookie"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Cookie"]
         
     def find_post_count_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
-            return row["Post_Count"]
+            row_dict = self._normalize_account_row(row)
+            return row_dict["Post_Count"]
 
     def get_account_by_id(self, path_chrome: str) -> Optional[Dict[str, Any]]:
         query = "SELECT * FROM accounts WHERE id = ?"
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query,(f"%{path_chrome}",)).fetchone()
-            return dict(row) if row else None
+            return self._normalize_account_row(row)
         
     def update_cookie_token_by_path(self, path_profile: str, cookie: str, token: str) -> bool:
         query = """ UPDATE accounts SET Cookie = ?, Token = ? WHERE Path_Chrome = ? """
