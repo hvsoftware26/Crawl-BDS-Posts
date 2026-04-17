@@ -1,0 +1,822 @@
+# Main GUI
+import sys, os, requests, json, shutil, subprocess
+from pathlib import Path
+from typing import List
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QTableWidgetItem, QMessageBox, QFileDialog,
+    QMenu, QHBoxLayout, QWidget, QCheckBox, QDialog,
+)
+from services.sql_query_service import AccountDB
+from resources.ui.gui import MultiProfileDialog, Ui_MainWindow, create_application
+from services.ai_service import OpenAIService
+from models.account import Info_data
+from workers.process_worker import Worker_Handle
+from app_config import (
+    CHROME_PATH,
+    FACEBOOK_LOGIN_URL,
+    build_profile_path_from_email,
+)
+
+def ensure_profile_directory(path_chrome: str) -> str:
+    profile_path = Path(path_chrome).resolve()
+    profile_path.mkdir(parents=True, exist_ok=True)
+    return str(profile_path)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.uic = Ui_MainWindow()
+        self.uic.setupUi(self)
+
+        self.group_count = 0
+        self.profile_lines: List[str] = []
+        self.api_key = None
+        self.group_file_path = None
+        self.prompt_file_path = None
+        self.tele_file_path = None
+        self.id_chat = None
+        self.token_tele = None
+        self.cycle_total = self.uic.spn_cycle_hours.value()
+        self.delay_get_post_gr = None
+        self.keywords_list = None
+        self.workers = []
+        self.view_chrome = None
+        self.view_chrome_path = None
+        self.is_running = False
+
+        self._connect_signals()
+        AccountDB(None)._create_table()
+        self.load_table()
+        self.update_delay_between_cycles()
+
+    def _connect_signals(self):
+        self.uic.profile_btn.clicked.connect(self.open_profile_dialog)
+        self.uic.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.uic.table.customContextMenuRequested.connect(self.show_menu)
+        self.uic.btn_import_group.clicked.connect(self.import_group_file)
+        self.uic.btn_import_prompt.clicked.connect(self.import_prompt_file)
+        self.uic.btn_select_tele.clicked.connect(self.import_tele_file)
+        self.uic.btn_check_api.clicked.connect(self.check_api_key)
+        self.uic.btn_clear_log.clicked.connect(self.clear_log)
+        self.uic.btn_select_all.clicked.connect(self.toggle_all_rows)
+        self.uic.btn_delete_row.clicked.connect(self.delete_selected_rows)
+        self.uic.btn_start.clicked.connect(self.start_tool)
+        self.uic.btn_stop.clicked.connect(self.stop_tool)
+        self.uic.spn_cycle_hours.valueChanged.connect(self.update_delay_between_cycles)
+
+    def append_log(self, text: str):
+        self.uic.console.append(text)
+
+    def clear_log(self):
+        self.uic.console.clear()
+        self.append_log("Đã xóa log hiển thị.")
+
+    @staticmethod
+    def _normalize_path(path_value: str) -> str:
+        return os.path.normcase(os.path.abspath(str(path_value or "").strip()))
+
+    def _same_profile_path(self, left: str, right: str) -> bool:
+        return bool(left and right and self._normalize_path(left) == self._normalize_path(right))
+
+    def _sync_view_chrome_state(self):
+        if self.view_chrome and self.view_chrome.poll() is not None:
+            closed_profile_name = os.path.basename(self.view_chrome_path or "")
+            self.view_chrome = None
+            self.view_chrome_path = None
+            if closed_profile_name:
+                self.append_log(f"Da dong Chrome profile: {closed_profile_name}")
+
+    def _is_view_chrome_running(self) -> bool:
+        self._sync_view_chrome_state()
+        return self.view_chrome is not None and self.view_chrome.poll() is None
+
+    def _is_profile_running_in_worker(self, path_chrome: str) -> bool:
+        normalized_path = self._normalize_path(path_chrome)
+        for worker in self.workers:
+            try:
+                if worker.isRunning() and self._normalize_path(getattr(worker.task, "path_chrome", "")) == normalized_path:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _collect_checked_profiles(self):
+        checked_profiles = []
+        db = AccountDB(None)
+
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if not item or item.checkState() != Qt.Checked:
+                continue
+
+            profile_item = self.uic.table.item(row, 2)
+            if profile_item is None:
+                continue
+
+            profile_name = profile_item.text().strip()
+            if not profile_name:
+                continue
+
+            full_path = db.find_full_path_from_path_chrome(profile_name)
+            checked_profiles.append(
+                {
+                    "row": row,
+                    "profile_name": profile_name,
+                    "full_path": full_path,
+                }
+            )
+
+        return checked_profiles
+
+    def update_interact_group(self, row: int, text: str):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.uic.table.setItem(row, 4, item)
+
+    def on_row_signal(self, row: int, text: str):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.uic.table.setItem(row, 5, item)
+
+    def on_task_finished(self, row: int, text: str):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignCenter)
+        self.uic.table.setItem(row, 5, item)
+
+    def _cleanup_finished_workers(self):
+        self.workers = [w for w in self.workers if w.isRunning()]
+        if not self.workers:
+            self.is_running = False
+            self.append_log("Tất cả worker đã kết thúc.")
+
+    def on_post_signal(self, row: int, status: int):
+        item = QTableWidgetItem(str(status))
+        item.setTextAlignment(Qt.AlignCenter)
+        self.uic.table.setItem(row, 6, item)
+
+    def start_tool(self):
+        if self.is_running:
+            QMessageBox.information(self, "Thông báo", "Tool đang chạy. Vui lòng dừng trước khi chạy lại.")
+            return
+
+        self.keywords_list = self.uic.edit_banned_keywords.text().strip()
+        self.cycle_total = self.uic.spn_cycle_hours.value()
+
+        required_fields = {
+            "API Key": self.api_key,
+            "File Group": self.group_file_path,
+            "File Prompt": self.prompt_file_path,
+            "File Tele": self.tele_file_path,
+            "ID Chat": self.id_chat,
+            "Token Tele": self.token_tele,
+            "Chu kỳ tổng": self.cycle_total,
+            "Delay lấy post group": self.delay_get_post_gr,
+        }
+
+        def is_missing(value):
+            if value is None:
+                return True
+            if isinstance(value, str):
+                return value.strip() == ""
+            return False
+
+        missing_fields = [name for name, value in required_fields.items() if is_missing(value)]
+
+        if missing_fields:
+            QMessageBox.warning(
+                self,
+                "Thiếu dữ liệu",
+                "Vui lòng nhập đầy đủ dữ liệu:\n\n- " + "\n- ".join(missing_fields)
+            )
+            return
+
+        tasks = self.build_data()
+        if not tasks:
+            return
+
+        if self._is_view_chrome_running():
+            conflict_task = next(
+                (task for task in tasks if self._same_profile_path(task.path_chrome, self.view_chrome_path)),
+                None,
+            )
+            if conflict_task is not None:
+                profile_name = os.path.basename(conflict_task.path_chrome or "")
+                QMessageBox.warning(
+                    self,
+                    "Thong bao",
+                    f"Profile {profile_name} dang mo Chrome. Hay dong Chrome cua profile nay truoc khi chay tool.",
+                )
+                return
+
+        self.workers.clear()
+        self.is_running = True
+        self.append_log("Bắt đầu chạy tool...")
+
+        for task in tasks:
+            row = task.row
+            worker = Worker_Handle(row, task)
+            worker.row_signal.connect(self.on_row_signal)
+            worker.interaction_signal.connect(self.update_interact_group)
+            worker.post_signal.connect(self.on_post_signal)
+            worker.finished_signal.connect(self.on_task_finished)
+            worker.finished.connect(lambda: self._cleanup_finished_workers())
+            worker.start()
+            self.workers.append(worker)
+
+    def stop_tool(self):
+        if not self.workers:
+            self.append_log("Không có worker nào đang chạy.")
+            self.is_running = False
+            return
+
+        self.append_log("Đang gửi tín hiệu dừng tới tất cả worker...")
+
+        alive_workers = []
+        for worker in self.workers:
+            try:
+                if worker.isRunning():
+                    worker.stop()
+                    alive_workers.append(worker)
+            except Exception as e:
+                self.append_log(f"Lỗi khi stop worker: {e}")
+
+        for worker in alive_workers:
+            try:
+                if not worker.wait(5000):
+                    self.append_log(f"Worker chưa dừng kịp: row={getattr(worker, 'row', 'unknown')}")
+            except Exception as e:
+                self.append_log(f"Lỗi khi wait worker: {e}")
+
+        self.workers = [w for w in self.workers if w.isRunning()]
+        self.is_running = len(self.workers) > 0
+
+        if self.is_running:
+            self.append_log("Một số worker vẫn chưa dừng hẳn.")
+        else:
+            self.append_log("Đã dừng tất cả worker.")
+
+    def load_table(self):
+        try:
+            self.uic.table.setUpdatesEnabled(False)
+            self.uic.table.setRowCount(0)
+
+            for data in AccountDB(None).get_all_accounts():
+                self.insert_row(
+                    data.get('Account_Name', ''),
+                    os.path.basename(data.get('Path_Chrome', '')).split("\\")[-1],
+                    data.get('Proxy', ''),
+                    "",
+                    data.get('Status', ''),
+                    data.get('Post_Count', ''),
+                )
+
+            self.uic.table.setUpdatesEnabled(True)
+        except Exception:
+            pass
+
+    
+    def _parse_profile_line(self, line: str, normal_mode: bool):
+        parts = [part.strip() for part in line.split('|')]
+
+        if normal_mode:
+            if len(parts) != 4:
+                raise ValueError("Dinh dang dung: ten tai khoan|email|password|2FA")
+            account_name, email, password, twofa = parts
+            proxy = "Khong"
+        else:
+            if len(parts) != 5:
+                raise ValueError("Dinh dang dung: ten tai khoan|proxy|email|password|2FA")
+            account_name, proxy, email, password, twofa = parts
+
+        if not account_name:
+            raise ValueError("Thieu ten tai khoan")
+
+        path_chrome = ensure_profile_directory(build_profile_path_from_email(email))
+
+        return {
+            "account_name": account_name,
+            "proxy": proxy,
+            "email": email.strip(),
+            "password": password.strip(),
+            "twofa": twofa.strip(),
+            "path_chrome": path_chrome,
+        }
+
+    def open_profile_dialog(self):
+        dialog = MultiProfileDialog(self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        raw_lines = [line.strip() for line in dialog.editor.toPlainText().splitlines() if line.strip()]
+        if not raw_lines:
+            QMessageBox.warning(self, 'Canh bao', 'Chua co du lieu profile.')
+            return
+
+        normal_mode = dialog.radio_normal.isChecked()
+        mode_label = "Profile Chrome" if normal_mode else "Profile Chrome - Proxy"
+        db = AccountDB(None)
+        created_count = 0
+        updated_count = 0
+
+        for line_number, line in enumerate(raw_lines, start=1):
+            try:
+                parsed_profile = self._parse_profile_line(line, normal_mode)
+                action = db.save_account_profile(**parsed_profile)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    'Canh bao',
+                    f'Dong {line_number} khong hop le:\n{exc}',
+                )
+                return
+
+            if action == "created":
+                created_count += 1
+            else:
+                updated_count += 1
+
+        self.load_table()
+
+        summary_text = (
+            f"Da luu {len(raw_lines)} profile | Che do: {mode_label}"
+            f" | Tao moi: {created_count} | Cap nhat: {updated_count}"
+        )
+        self.uic.profile_info.setText(summary_text)
+        self.append_log(summary_text)
+
+    def import_group_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file danh sách group",
+            "",
+            "Text/CSV/JSON (*.txt *.csv *.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self.group_file_path = path
+        self.group_count = self.count_non_empty_lines(path)
+        self.uic.group_path.setText(f"{path} | Số lượng group: {self.group_count}")
+        self.update_delay_between_cycles()
+        self.append_log(f"Đã import danh sách group: {self.group_count} group")
+
+    def import_prompt_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file prompt",
+            "",
+            "Text Files (*.txt *.md *.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        self.prompt_file_path = path
+        self.uic.prompt_path.setText(path)
+        self.append_log("Đã import prompt GPT")
+
+    def import_tele_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Chọn file cấu hình bot tele",
+            "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            id_chat = data.get("id_chat", "").strip()
+            token_tele = data.get("token_tele", "").strip()
+
+            if not id_chat or not token_tele:
+                QMessageBox.warning(self, "Lỗi", "File JSON thiếu id_chat hoặc token_tele!")
+                return
+
+            self.tele_file_path = path
+            self.id_chat = id_chat
+            self.token_tele = token_tele
+            self.uic.tele_path.setText(path)
+
+            self.append_log("Đã import TELE:")
+            self.append_log(f" - Chat ID: {id_chat}")
+            self.append_log(f" - Token: {token_tele[:10]}********")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không đọc được file JSON:\n{e}")
+
+    def check_api_key(self):
+        api_key = self.uic.api_edit.text().strip()
+        if api_key == "demo":
+            api_key = "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"
+        if not api_key:
+            QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập API key trước khi kiểm tra.")
+            return
+
+        prefix_ok = api_key.startswith('sk-')
+        length_ok = len(api_key) >= 20
+        if not prefix_ok or not length_ok:
+            QMessageBox.warning(self, 'Kiểm tra key', 'API key có vẻ không đúng định dạng cơ bản.')
+            self.append_log('Check key: key không đúng định dạng cơ bản.')
+            return
+
+        try:
+            model_name = 'gpt-5.4-nano'
+            service = OpenAIService(api_key=api_key, model=model_name, timeout=20)
+            result = service.check_api_key()
+
+            if not result.get('valid'):
+                msg = f"API key không hợp lệ.\n\nKey: {result.get('masked_key', '')}\nLý do: {result.get('message', 'Không xác định')}"
+                QMessageBox.warning(self, 'Kiểm tra key', msg)
+                self.append_log(f"Check key fail: {result.get('message', '')}")
+                return
+
+            sample_models = result.get('sample_models', [])
+            sample_models_text = '\n'.join(sample_models[:10]) if sample_models else 'Không có'
+            info_text = (
+                f"API key hợp lệ\n\n"
+                f"Key: {result.get('masked_key', '')}\n"
+                f"Model mặc định: {result.get('default_model', '')}\n"
+                f"Dùng được model mặc định: {'Có' if result.get('default_model_ok') else 'Không'}\n"
+                f"Tổng model thấy được: {result.get('models_count', 0)}\n\n"
+                f"Một số model khả dụng:\n{sample_models_text}\n"
+            )
+            QMessageBox.information(self, 'Kiểm tra key', info_text)
+            self.append_log('Check key: API key hợp lệ, đã lấy thông tin model.')
+            self.api_key = api_key
+
+        except Exception as e:
+            QMessageBox.critical(self, 'Kiểm tra key', f'Lỗi khi kiểm tra API key:\n{e}')
+            self.append_log(f'Check key exception: {e}')
+
+    @staticmethod
+    def count_non_empty_lines(path: str) -> int:
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                return sum(1 for line in file if line.strip())
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="utf-8-sig", errors="ignore") as file:
+                return sum(1 for line in file if line.strip())
+        except Exception:
+            return 0
+
+    @staticmethod
+    def format_minutes_value(value: float) -> str:
+        rounded = round(value, 1)
+        if abs(rounded - int(rounded)) < 1e-9:
+            return f"{int(rounded)} phút"
+        return f"{rounded:.1f}".replace(".", ",") + " phút"
+
+    def update_delay_between_cycles(self):
+        if self.group_count <= 0:
+            self.uic.lb_delay_between_cycles.setText("Delay giữa các chu kỳ: 0 phút")
+            self.delay_get_post_gr = "0"
+            return
+
+        minutes_per_cycle = (self.uic.spn_cycle_hours.value() * 60.0) / self.group_count
+        self.uic.lb_delay_between_cycles.setText(f"Delay giữa các chu kỳ: {self.format_minutes_value(minutes_per_cycle)}")
+        rounded = round(minutes_per_cycle, 1)
+        self.delay_get_post_gr = str(int(rounded)) if abs(rounded - int(rounded)) < 1e-9 else str(rounded).replace(".", ",")
+
+    def toggle_all_rows(self):
+        target = not self.are_all_checked()
+        state = Qt.Checked if target else Qt.Unchecked
+
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+
+    def are_all_checked(self) -> bool:
+        total = self.uic.table.rowCount()
+        if total == 0:
+            return False
+
+        for row in range(total):
+            item = self.uic.table.item(row, 0)
+            if not item or item.checkState() != Qt.Checked:
+                return False
+
+        return True
+
+    def delete_selected_rows(self):
+        selected_accounts = []
+        db = AccountDB(None)
+        self._sync_view_chrome_state()
+
+        for profile in self._collect_checked_profiles():
+            account_id = db.find_id_from_path_chrome(profile["profile_name"])
+            selected_accounts.append((account_id, profile["full_path"]))
+
+        if not selected_accounts:
+            QMessageBox.warning(self, "Thông báo", "Chưa có profiles nào được chọn!")
+            return
+
+        for _, full_path in selected_accounts:
+            if self._same_profile_path(full_path, self.view_chrome_path):
+                QMessageBox.warning(
+                    self,
+                    "Thong bao",
+                    "Khong the xoa profile dang mo trong Chrome. Hay dong Chrome truoc.",
+                )
+                return
+
+            if self._is_profile_running_in_worker(full_path):
+                QMessageBox.warning(
+                    self,
+                    "Thong bao",
+                    "Khong the xoa profile dang duoc worker su dung.",
+                )
+                return
+
+        delete_accept = QMessageBox.question(
+            self,
+            'Xác nhận',
+            f'Xác nhận xóa {len(selected_accounts)} profiles ?',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if delete_accept == QMessageBox.Yes:
+            for account_id, full_path in reversed(selected_accounts):
+                AccountDB(None).delete_account(account_id)
+                try:
+                    shutil.rmtree(full_path)
+                except FileNotFoundError:
+                    pass
+            self.append_log(f"Đã xóa {len(selected_accounts)} profiles.")
+
+        self.load_table()
+
+    def _set_item(self, row, col, value, align):
+        item = QTableWidgetItem(str(value))
+        item.setTextAlignment(int(align))
+        self.uic.table.setItem(row, col, item)
+
+    def insert_row(self, account_name, path_chrome, proxy, interact, status, post_count):
+        self.uic.table.setColumnCount(7)
+        row = self.uic.table.rowCount()
+        self.uic.table.insertRow(row)
+
+        checkbox_item = QTableWidgetItem()
+        checkbox_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        checkbox_item.setCheckState(Qt.Unchecked)
+        checkbox_item.setTextAlignment(int(Qt.AlignHCenter | Qt.AlignVCenter))
+        self.uic.table.setItem(row, 0, checkbox_item)
+
+        self._set_item(row, 1, account_name, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 2, path_chrome, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 3, proxy, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 4, interact, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 5, status, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 6, post_count, Qt.AlignHCenter | Qt.AlignVCenter)
+
+    def show_menu(self, pos):
+        item = self.uic.table.itemAt(pos)
+        if item is None:
+            return
+
+        menu = QMenu(self)
+        copy_path_ = menu.addAction("📋 Copy đường dẫn chrome")
+        copy_proxy = menu.addAction("🌍 Copy proxy (tài nguyên)")
+        copy_info_account = menu.addAction("📧 Copy mail|pass|2FA")
+        copy_token = menu.addAction("🔑 Copy token (tài nguyên)")
+        copy_cookie = menu.addAction("🍪 Copy cookie (tài nguyên)")
+        open_chrome = menu.addAction("🌐 Mở Chrome / Xem Chrome")
+
+        selected_action = menu.exec(self.uic.table.viewport().mapToGlobal(pos))
+        if selected_action == copy_path_:
+            self.copy_path()
+        elif selected_action == copy_proxy:
+            self.copy_proxy()
+        elif selected_action == copy_info_account:
+            self.copy_info_account()
+        elif selected_action == copy_token:
+            self.copy_token()
+        elif selected_action == copy_cookie:
+            self.copy_cookie()
+        elif selected_action == open_chrome:
+            self.open_chrome()
+
+    def copy_path(self):
+        checked_paths = []
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                profile_name = self.uic.table.item(row, 2).text()
+                checked_paths.append(AccountDB(None).find_full_path_from_path_chrome(profile_name))
+        if not checked_paths:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy đường dẫn chrome.')
+            return
+        QApplication.clipboard().setText('\n'.join(checked_paths))
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} đường dẫ chrome.')
+
+    def copy_proxy(self):
+        checked_paths = []
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                profile_name = self.uic.table.item(row, 2).text()
+                checked_paths.append(AccountDB(None).find_proxy_from_path_chrome(profile_name))
+        if not checked_paths:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy proxy.')
+            return
+        QApplication.clipboard().setText('\n'.join(checked_paths))
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} proxy.')
+
+    def copy_info_account(self):
+        checked_paths = []
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                profile_name = self.uic.table.item(row, 2).text()
+                checked_paths.append(AccountDB(None).find_info_account_from_path_chrome(profile_name))
+        if not checked_paths:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy mail|pass|2FA.')
+            return
+        QApplication.clipboard().setText('\n'.join(checked_paths))
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} mail|pass|2FA.')
+
+    def copy_token(self):
+        checked_paths = []
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                profile_name = self.uic.table.item(row, 2).text()
+                checked_paths.append(AccountDB(None).find_token_from_path_chrome(profile_name))
+        if not checked_paths:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy token.')
+            return
+        QApplication.clipboard().setText('\n'.join(checked_paths))
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} token.')
+
+    def copy_cookie(self):
+        checked_paths = []
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                profile_name = self.uic.table.item(row, 2).text()
+                checked_paths.append(AccountDB(None).find_cookie_from_path_chrome(profile_name))
+        if not checked_paths:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy cookie.')
+            return
+        QApplication.clipboard().setText('\n'.join(checked_paths))
+        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} cookie.')
+
+
+    def open_chrome(self):
+        checked_profiles = self._collect_checked_profiles()
+        if not checked_profiles:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để mở chrome.')
+            return
+
+        if len(checked_profiles) > 1:
+            QMessageBox.information(self, 'Thông báo', 'Chỉ nên chọn 1 profile khi mở Chrome.')
+            return
+
+        selected_profile = checked_profiles[0]
+        profile_path = ensure_profile_directory(selected_profile["full_path"])
+        profile_name = selected_profile["profile_name"]
+
+        if self._is_profile_running_in_worker(profile_path):
+            QMessageBox.warning(
+                self,
+                'Thông báo',
+                f'Profile {profile_name} đang được worker sử dụng. Hãy dừng worker trước khi mở Chrome tay.',
+            )
+            return
+
+        if self._is_view_chrome_running():
+            if self._same_profile_path(profile_path, self.view_chrome_path):
+                QMessageBox.information(self, 'Thông báo', f'Profile {profile_name} đang mở Chrome.')
+            else:
+                current_profile = os.path.basename(self.view_chrome_path or "")
+                QMessageBox.information(
+                    self,
+                    'Thông báo',
+                    f'Một profile Chrome khác đang mở ({current_profile}). Hãy đóng cửa sổ đó trước.',
+                )
+            return
+
+        chrome_args = [
+            CHROME_PATH,
+            f"--user-data-dir={profile_path}",
+            "--new-window",
+            "--no-first-run",
+            "--no-default-browser-check",
+            FACEBOOK_LOGIN_URL,
+        ]
+
+        try:
+            self.view_chrome = subprocess.Popen(chrome_args)
+        except Exception as exc:
+            QMessageBox.critical(self, 'Lỗi', f'Không mở được Chrome:\n{exc}')
+            self.view_chrome = None
+            self.view_chrome_path = None
+            return
+
+        self.view_chrome_path = profile_path
+        self.append_log(f"Đã mở Chrome cho profile: {profile_name}")
+
+    def build_data(self):
+        tasks = []
+
+        keywords_raw = self.uic.edit_banned_keywords.text().strip()
+        keywords_list = [keyword.strip() for keyword in keywords_raw.split(",") if keyword.strip()] if keywords_raw else [""]
+
+        groups_list = None
+        if self.group_file_path:
+            try:
+                with open(self.group_file_path, "r", encoding="utf-8") as file:
+                    groups_list = [line.strip() for line in file if line.strip()]
+            except UnicodeDecodeError:
+                with open(self.group_file_path, "r", encoding="utf-8-sig", errors="ignore") as file:
+                    groups_list = [line.strip() for line in file if line.strip()]
+            except Exception:
+                groups_list = None
+
+        prompt = ""
+        if self.prompt_file_path:
+            try:
+                with open(self.prompt_file_path, "r", encoding="utf-8") as file:
+                    prompt = file.read().strip()
+            except UnicodeDecodeError:
+                with open(self.prompt_file_path, "r", encoding="utf-8-sig", errors="ignore") as file:
+                    prompt = file.read().strip()
+            except Exception:
+                prompt = ""
+
+        db = AccountDB(None)
+
+        for row in range(self.uic.table.rowCount()):
+            item = self.uic.table.item(row, 0)
+            if not item or item.checkState() != Qt.Checked:
+                continue
+
+            profile_item = self.uic.table.item(row, 2)
+            if profile_item is None:
+                continue
+
+            profile_name = profile_item.text()
+
+            account_name = db.find_account_name_from_path_chrome(profile_name)
+            path_profile = db.find_full_path_from_path_chrome(profile_name)
+            proxy = db.find_proxy_from_path_chrome(profile_name)
+            info_account = db.find_info_account_from_path_chrome(profile_name)
+            cookie = db.find_cookie_from_path_chrome(profile_name)
+            token = db.find_token_from_path_chrome(profile_name)
+            post_count = db.find_post_count_from_path_chrome(profile_name)
+
+            email, password, twofa = "", "", ""
+            if info_account:
+                info_parts = info_account.split("|", 2)
+                if len(info_parts) == 3:
+                    email, password, twofa = info_parts
+                elif len(info_parts) == 2:
+                    email, password = info_parts
+                elif len(info_parts) == 1:
+                    email = info_parts[0]
+
+            tasks.append(
+                Info_data(
+                    row=row,
+                    account_name=account_name or "",
+                    path_chrome=path_profile or "",
+                    proxy=proxy or "",
+                    email=email or "",
+                    password=password or "",
+                    twofa=twofa or "",
+                    cookie=cookie or "",
+                    token=token or "",
+                    post_count=str(post_count or ""),
+                    api_key=self.api_key or "",
+                    groups_list=groups_list,
+                    prompt=prompt,
+                    id_chat=self.id_chat or "",
+                    token_tele=self.token_tele or "",
+                    cycle_total=float(self.cycle_total) if self.cycle_total is not None else 0.0,
+                    delay_get_post_gr=float(str(self.delay_get_post_gr).replace(",", ".")) if self.delay_get_post_gr not in (None, "") else 0.0,
+                    keywords_list=keywords_list,
+                )
+            )
+
+        if not tasks:
+            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để chạy tool.')
+            return []
+
+        return tasks
+
+
+def main():
+    app = create_application()
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
