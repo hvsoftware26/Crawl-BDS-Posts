@@ -63,12 +63,21 @@ class ScanGroups:
     def _send_group_report(self, group_summary: dict, send_type: int):
         valid_posts = self._extract_valid_posts(group_summary.get("posts_status"))
         report_id = group_summary.get("group_id")
+        
+        logger.debug(
+            "Filtering posts for report: report_type=%s report_id=%s total_posts=%s valid_posts=%s",
+            "cycle" if send_type == 1 else "group",
+            report_id,
+            len(group_summary.get("posts_status", [])),
+            len(valid_posts),
+        )
 
         if not valid_posts:
             logger.info(
-                "Skipping Telegram report because there are no valid posts: report_type=%s report_id=%s",
+                "Skipping Telegram report because there are no valid posts: report_type=%s report_id=%s total_in_summary=%s",
                 "cycle" if send_type == 1 else "group",
                 report_id,
+                len(group_summary.get("posts_status", [])),
             )
             return
 
@@ -151,6 +160,7 @@ class ScanGroups:
         )
         posts_status = []
         cycle_valid_posts = []
+        cycle_seen_post_ids = set()  # 👈 Add deduplication tracking
         processed_groups = 0
 
         for group_summary in group_service.get_posts():
@@ -158,7 +168,13 @@ class ScanGroups:
             group_posts_status = group_summary.get("posts_status", [])
             group_valid_posts = self._extract_valid_posts(group_posts_status)
 
-            cycle_valid_posts.extend(group_valid_posts)
+            # 👈 Deduplicate posts before adding to cycle
+            for post in group_valid_posts:
+                post_id = post.get("id")
+                if post_id and post_id not in cycle_seen_post_ids:
+                    cycle_valid_posts.append(post)
+                    cycle_seen_post_ids.add(post_id)
+            
             self._send_group_report(group_summary, send_type=0)
             posts_status.extend(group_posts_status)
 
@@ -169,16 +185,24 @@ class ScanGroups:
                 1 for post in group_posts_status if post.get("status") == 0
             )
             logger.info(
-                "Group summary before Telegram: group_id=%s total=%s valid=%s invalid=%s",
+                "Group summary before Telegram: group_id=%s total=%s valid=%s invalid=%s unique_in_cycle=%s",
                 group_summary.get("group_id"),
                 len(group_posts_status),
                 valid_posts_count,
                 invalid_posts_count,
+                len(group_valid_posts),
             )
 
         if processed_groups == 0:
             logger.info("Skipping cycle Telegram report because no groups were processed")
             return posts_status
+        
+        logger.info(
+            "Cycle summary before sending: total_groups_processed=%s cycle_valid_posts=%s cycle_deduped_posts=%s",
+            processed_groups,
+            sum(1 for post in posts_status if post.get("status") == 1),
+            len(cycle_valid_posts),
+        )
 
         cycle_summary = {
             "group_id": f"cycle_summary_{processed_groups}_groups",

@@ -308,7 +308,19 @@ class GroupService:
             try:
                 res_posts = self._collect_recent_posts(group_id)
                 if not res_posts:
-                    return
+                    logger.warning(
+                        "No posts collected for group_id=%s, skipping to next group",
+                        group_id,
+                    )
+                    yield {
+                        "group_id": group_id,
+                        "total_posts": 0,
+                        "filtered_posts_count": 0,
+                        "posts_status_count": 0,
+                        "posts_status": [],
+                        "error": "No posts collected",
+                    }
+                    continue
                 logger.info(
                     "Collected %s recent posts from group %s",
                     res_posts.get("total_posts"),
@@ -377,6 +389,17 @@ class GroupService:
                 self.status_callback("Lỗi khi xử lý nhóm")
                 if not self.sleep_with_stop(1):
                     return
+                
+                # ✅ Yield error result and continue to next group instead of returning
+                yield {
+                    "group_id": group_id,
+                    "total_posts": 0,
+                    "filtered_posts_count": 0,
+                    "posts_status_count": 0,
+                    "posts_status": [],
+                    "error": error_message,
+                }
+                continue
 
             valid_posts_count = sum(
                 1 for post in posts_status if post.get("status") == 1
