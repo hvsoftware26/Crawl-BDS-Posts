@@ -1,4 +1,4 @@
-# Facebook BĐS - Crawl dữ liệu bài viết REAL TIME
+# Facebook BDS Lead Finder
 
 Tool desktop dùng để quản lý nhiều profile Facebook, quét bài viết trong danh sách group, lọc bài theo keyword và prompt AI, sau đó xuất kết quả ra file Excel và gửi về Telegram.
 
