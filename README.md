@@ -38,7 +38,7 @@ python -m venv .venv
 Cài các thư viện cần thiết:
 
 ```powershell
-pip install PyQt5 playwright requests fake-useragent openpyxl
+pip install -r requirements.txt
 ```
 
 Nếu môi trường Playwright yêu cầu cài driver bổ sung, chạy thêm:
