@@ -1,7 +1,7 @@
 # Facebook BDS Lead Finder
 
 Tool desktop dùng để quản lý nhiều profile Facebook, quét bài viết trong danh sách group, lọc bài theo keyword và prompt AI, sau đó xuất kết quả ra file Excel và gửi về Telegram.
-
+Tool phục vụ nhu cầu tìm kiếm khách hàng tiềm năng có nhu cầu cho đa lĩnh vực Sales, Bất động sản,....
 Dự án được viết bằng Python, giao diện PyQt5, chạy trên Windows và sử dụng Google Chrome profile riêng cho từng tài khoản.
 
 ## Chức năng chính
