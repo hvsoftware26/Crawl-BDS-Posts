@@ -16,13 +16,17 @@ class ScanController:
         groups_list,
         delay,
         keywords,
+        recent_window_minutes=None,
         account_token=None,
         account_cookies=None,
+        account_name=None,
         proxies=None,
         API_KEY=None,
         token_tele=None,
         idchat=None,
         prompt=None,
+        prompt_cmt=None,
+        prompt_cmt_mode="text",
         max_length_text: int = 500,
         progress_callback=None,
         status_callback=None,
@@ -32,14 +36,18 @@ class ScanController:
     ):
         self.groups_list = groups_list
         self.delay = delay
+        self.recent_window_minutes = recent_window_minutes
         self.keywords = keywords
         self.account_token = account_token
         self.account_cookies = account_cookies
+        self.account_name = account_name
         self.proxies = proxies
         self.API_KEY = API_KEY
         self.token_tele = token_tele
         self.idchat = idchat
         self.prompt = prompt
+        self.prompt_cmt = prompt_cmt
+        self.prompt_cmt_mode = prompt_cmt_mode
         self.max_length_text = max_length_text
         self.progress_callback = progress_callback
         self.status_callback = status_callback
@@ -87,13 +95,17 @@ class ScanController:
             groups_list=self.groups_list,
             delay = self.delay,
             keywords=self.keywords,
+            recent_window_minutes=self.recent_window_minutes,
             account_token=self.account_token,
             account_cookies=self.account_cookies,
+            account_name=self.account_name,
             proxies=self.proxies,
             API_KEY=self.API_KEY,
             token_tele=self.token_tele,
             idchat=self.idchat,
             prompt=self.prompt,
+            prompt_cmt=self.prompt_cmt,
+            prompt_cmt_mode=self.prompt_cmt_mode,
             max_length_text=self.max_length_text,
             progress_callback=self.progress_callback,
             status_callback = self.status_callback,
