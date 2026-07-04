@@ -61,7 +61,8 @@ def nomalize_post(posts: list[dict],max_length_text: int = 500, stop_callback=No
 
 def rm_non_keywords_posts(posts: list[dict], keywords: list[str], status_callback, stop_callback=None):
     """
-    Keep only posts that contain at least one keyword.
+    Remove posts that contain at least one banned keyword.
+    Function name is kept for backward compatibility.
     """
 
     def sleep_with_stop(seconds):
@@ -97,6 +98,36 @@ def rm_non_keywords_posts(posts: list[dict], keywords: list[str], status_callbac
             return []
 
         return posts.copy()
+
+    filtered_posts = []
+    removed_with_banned_keyword = 0
+
+    for post in posts or []:
+        if stop_callback and stop_callback():
+            return filtered_posts
+
+        message = str((post or {}).get("message") or "").lower()
+        if any(keyword in message for keyword in normalized_keywords):
+            removed_with_banned_keyword += 1
+        else:
+            filtered_posts.append(post)
+
+    logger.info(
+        "Banned keyword filter completed: input_posts=%s kept_posts=%s removed_with_banned_keyword=%s keywords=%s",
+        len(posts or []),
+        len(filtered_posts),
+        removed_with_banned_keyword,
+        normalized_keywords,
+    )
+    status_callback(
+        "Lọc keyword cấm: giữ %s/%s bài viết, loại %s bài"
+        % (len(filtered_posts), len(posts or []), removed_with_banned_keyword)
+    )
+
+    if not sleep_with_stop(1):
+        return filtered_posts
+
+    return filtered_posts
 
 
 def check_posts_by_AI(
