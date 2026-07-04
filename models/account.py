@@ -24,3 +24,5 @@ class Info_data:
     cycle_total: int #Hours
     delay_get_post_gr: float #Min
     keywords_list: Optional[List[str]] #List
+    prompt_cmt: str = ""
+    prompt_cmt_mode: str = "text"
