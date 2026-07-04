@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
 
 APP_STYLE = """
 QMainWindow, QWidget {
-    background: #eef3f8;
+    background: #F4F7FB;
     color: #16243b;
     font-family: 'Segoe UI';
     font-size: 13px;
@@ -165,7 +165,7 @@ QTextEdit#consoleBox {
     font-family: Consolas;
 }
 QDialog {
-    background: #eef3f8;
+    background: #F4F7FB;
 }
 QRadioButton {
     spacing: 10px;
@@ -247,7 +247,7 @@ class DecimalBox(QDoubleSpinBox):
 class MultiProfileDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Chọn nhiều profile")
+        self.setWindowTitle("Thêm tài khoản")
         self.resize(760, 470)
         self.setModal(True)
         self.build_ui()
@@ -257,7 +257,7 @@ class MultiProfileDialog(QDialog):
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(14)
 
-        title = QLabel("Chọn nhiều profile Chrome")
+        title = QLabel("Thêm tài khoản")
         title.setObjectName("pageTitle")
         root.addWidget(title)
 
@@ -290,7 +290,7 @@ class MultiProfileDialog(QDialog):
 
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText(
-            "Dán danh sách profile tại đây...\n"
+            "Dán danh sách tài khoản tại đây...\n"
             "Dùng proxy chọn chế độ Profile Chrome-Proxy:\n"
             "Tên tài khoản|proxy|email|password|2FA\n"
             "Không dùng proxy chọn chế độ Profile Chrome:\n"
@@ -318,13 +318,13 @@ class MultiProfileDialog(QDialog):
     def update_help_text(self):
         if self.radio_proxy.isChecked():
             text = (
-                "Dán nhiều dòng profile vào đây. Mỗi dòng là 1 profile.\n"
+                "Dán nhiều dòng tài khoản vào đây. Mỗi dòng là 1 tài khoản.\n"
                 "Ví dụ:\n"
                 "Tên tài khoản|127.0.0.1:8000:user:pass|example@gmail.com|Nohope1111@@|2FA"
             )
         else:
             text = (
-                "Dán nhiều dòng profile vào đây. Mỗi dòng là 1 profile.\n"
+                "Dán nhiều dòng tài khoản vào đây. Mỗi dòng là 1 tài khoản.\n"
                 "Ví dụ:\n"
                 "Tên tài khoản|example@gmail.com|Nohope1111@@|2FA"
             )
@@ -360,18 +360,42 @@ class Ui_MainWindow(object):
         self.api_edit = PlaceholderPathEdit("Nhập API key ChatGPT...")
         self.btn_check_api = QPushButton("Check key")
 
-        self.group_label = LabelBox("Thêm danh sách group")
+        self.group_label = LabelBox("Danh sách group")
         self.group_path = PlaceholderPathEdit("Chưa chọn file danh sách group...")
         self.group_path.setReadOnly(True)
         self.btn_import_group = QPushButton("Import file")
 
-        self.prompt_label = LabelBox("Dùng prompt GPT")
+        self.prompt_label = LabelBox("AI lọc bài viết")
         self.prompt_path = PlaceholderPathEdit("Chưa import file prompt...")
         self.prompt_path.setReadOnly(True)
-        self.btn_import_prompt = QPushButton("Import prompt")
+        self.btn_import_prompt = QPushButton("Thêm prompt")
 
-        self.profile_btn = QPushButton("Chọn nhiều profile")
-        self.profile_info = PlaceholderPathEdit("Chưa thêm profile...")
+        self.prompt_cmt_label = LabelBox("Bình luận")
+        self.prompt_cmt_path = PlaceholderPathEdit("Chưa import file prompt cmt...")
+        self.prompt_cmt_path.setReadOnly(True)
+        self.btn_import_prompt_cmt = QPushButton("Thêm file /prompt")
+        self.radio_prompt_cmt_text = QRadioButton("Cmt sẵn")
+        self.radio_prompt_cmt_ai = QRadioButton("Dùng AI")
+        self.radio_prompt_cmt_text.setChecked(True)
+        self.prompt_cmt_mode_group = QButtonGroup(MainWindow)
+        self.prompt_cmt_mode_group.addButton(self.radio_prompt_cmt_text)
+        self.prompt_cmt_mode_group.addButton(self.radio_prompt_cmt_ai)
+
+        self.prompt_cmt_row = QHBoxLayout()
+        self.prompt_cmt_row.setContentsMargins(0, 0, 0, 0)
+        self.prompt_cmt_row.setSpacing(8)
+        self.prompt_cmt_mode_layout = QVBoxLayout()
+        self.prompt_cmt_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.prompt_cmt_mode_layout.setSpacing(0)
+        self.prompt_cmt_mode_layout.addWidget(self.radio_prompt_cmt_text)
+        self.prompt_cmt_mode_layout.addWidget(self.radio_prompt_cmt_ai)
+        self.prompt_cmt_row.addWidget(self.prompt_cmt_label)
+        self.prompt_cmt_row.addLayout(self.prompt_cmt_mode_layout)
+        self.prompt_cmt_row.addWidget(self.prompt_cmt_path, 1)
+        self.prompt_cmt_row.addWidget(self.btn_import_prompt_cmt)
+
+        self.profile_btn = QPushButton("Thêm tài khoản")
+        self.profile_info = PlaceholderPathEdit("Chưa thêm tài khoản...")
         self.profile_info.setReadOnly(True)
 
         self.tele_label = LabelBox("Cấu hình bot tele")
@@ -383,20 +407,21 @@ class Ui_MainWindow(object):
             (self.api_label, 0, 0, 1, 1),
             (self.api_edit, 0, 1, 1, 3),
             (self.btn_check_api, 0, 4, 1, 1),
-            (self.group_label, 0, 5, 1, 1),
-            (self.group_path, 0, 6, 1, 2),
-            (self.btn_import_group, 0, 8, 1, 1),
-            (self.prompt_label, 0, 9, 1, 1),
-            (self.prompt_path, 0, 10, 1, 2),
-            (self.btn_import_prompt, 0, 12, 1, 1),
+            (self.prompt_label, 0, 5, 1, 1),
+            (self.prompt_path, 0, 6, 1, 2),
+            (self.btn_import_prompt, 0, 8, 1, 1),
+            (self.group_label, 0, 9, 1, 1),
+            (self.group_path, 0, 10, 1, 2),
+            (self.btn_import_group, 0, 12, 1, 1),
             (self.profile_btn, 1, 0, 1, 1),
-            (self.profile_info, 1, 1, 1, 5),
-            (self.tele_label, 1, 6, 1, 1),
-            (self.tele_path, 1, 7, 1, 5),
-            (self.btn_select_tele, 1, 12, 1, 1),
+            (self.profile_info, 1, 1, 1, 3),
+            (self.tele_label, 1, 4, 1, 1),
+            (self.tele_path, 1, 5, 1, 3),
+            (self.btn_select_tele, 1, 8, 1, 1),
         ]
         for widget, r, c, rs, cs in widgets:
             self.grid.addWidget(widget, r, c, rs, cs)
+        self.grid.addLayout(self.prompt_cmt_row, 1, 9, 1, 4)
 
         for col, stretch in {
             0: 2, 1: 3, 2: 2, 3: 2, 4: 2, 5: 2, 6: 2,
@@ -410,6 +435,9 @@ class Ui_MainWindow(object):
         self.controls.setHorizontalSpacing(10)
         self.controls.setVerticalSpacing(10)
 
+        self.lbl_threads = LabelBox("Số luồng")
+        self.spn_threads = NumberBox(1, 50, 1)
+
         self.lbl_cycle_hours = LabelBox("Chu kỳ")
         self.spn_cycle_hours = DecimalBox(0.1, 999999.0, 4.0, " tiếng", 1)
 
@@ -420,6 +448,7 @@ class Ui_MainWindow(object):
         self.edit_banned_keywords = PlaceholderPathEdit("Nhập keyword cấm...")
 
         control_items = [
+            self.lbl_threads, self.spn_threads,
             self.lbl_cycle_hours, self.spn_cycle_hours,
             self.lbl_banned_keywords, self.edit_banned_keywords,
         ]
@@ -473,10 +502,10 @@ class Ui_MainWindow(object):
         self.left_layout.setContentsMargins(12, 12, 12, 12)
         self.left_layout.setSpacing(10)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "Quét", "Tên tài khoản", "Path chrome", "Proxy",
-            "Tương tác group", "Status", "Số bài viết"
+            "✅", "Tên tài khoản", "Path chrome", "Proxy",
+            "Tổng số page", "Tương tác group", "Status", "Số bài viết đã cmt"
         ])
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -493,8 +522,9 @@ class Ui_MainWindow(object):
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.Stretch)
+        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         self.left_layout.addWidget(self.table)
 
         self.bottom_buttons = QHBoxLayout()
@@ -521,7 +551,7 @@ class Ui_MainWindow(object):
         self.outer.addLayout(self.body_layout, 1)
 
         self.table.setColumnWidth(0, 42)
-        self.table.setColumnWidth(6, 110)
+        self.table.setColumnWidth(7, 140)
 
 
 def create_application():
