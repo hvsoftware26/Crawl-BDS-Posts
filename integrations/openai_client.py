@@ -89,6 +89,111 @@ def _build_batch_filter_instructions(instructions: str) -> str:
         "{\"matched_posts\": []}"
     )
 
+
+def _clean_generated_comment(value: str) -> str:
+    comment = str(value or "").strip()
+    comment = comment.strip("`").strip()
+
+    if comment.startswith('"') and comment.endswith('"') and len(comment) >= 2:
+        comment = comment[1:-1].strip()
+
+    comment = " ".join(comment.split())
+    return comment
+
+
+def generate_comment_with_openai(
+    post: Dict[str, Any],
+    prompt: Union[str, Dict[str, Any]],
+    api_key: str,
+    model: Optional[str] = None,
+    proxies: Optional[Dict[str, str]] = None,
+    timeout: int = 45,
+) -> str:
+    if not isinstance(post, dict) or not post:
+        raise ValueError("Post is required")
+
+    instructions, resolved_model = _resolve_prompt_config(prompt, model=model)
+    post_payload = {
+        "id": post.get("id"),
+        "title": post.get("message") or "",
+        "message": post.get("message") or "",
+        "created_time": post.get("created_time"),
+        "group_id": post.get("group_id"),
+    }
+    request_payload = {
+        "model": resolved_model,
+        "instructions": (
+            f"{instructions}\n\n"
+            "Tạo nội dung bình luận cho bài viết trong input.\n"
+            "Chỉ trả về JSON object có đúng một key là 'comment'.\n"
+            "Giá trị 'comment' là đúng một câu bình luận duy nhất, không giải thích."
+        ),
+        "input": json.dumps(post_payload, ensure_ascii=False),
+        "store": False,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "generated_comment",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "comment": {
+                            "type": "string",
+                            "description": "A single natural Facebook comment.",
+                        },
+                    },
+                    "required": ["comment"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+
+    logger.info(
+        "Generating AI comment: post_id=%s model=%s has_proxies=%s timeout=%ss",
+        post.get("id"),
+        resolved_model,
+        bool(proxies),
+        timeout,
+    )
+    response = requests.post(
+        OPENAI_RESPONSES_API_URL,
+        headers=_build_headers(api_key),
+        json=request_payload,
+        proxies=proxies,
+        timeout=timeout,
+    )
+    if response.status_code != 200:
+        logger.error(
+            "OpenAI comment request failed: post_id=%s status_code=%s body=%s",
+            post.get("id"),
+            response.status_code,
+            response.text,
+        )
+        raise Exception(f"OpenAI comment request failed: {response.text}")
+
+    raw_result = _extract_output_text(response.json())
+    if not raw_result:
+        raise ValueError("OpenAI comment response is empty")
+
+    try:
+        parsed_result = json.loads(raw_result)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"OpenAI comment response is invalid JSON: {raw_result}") from exc
+
+    comment = _clean_generated_comment(parsed_result.get("comment", ""))
+    if not comment:
+        raise ValueError("OpenAI returned empty comment")
+
+    logger.info(
+        "Generated AI comment: post_id=%s comment_length=%s",
+        post.get("id"),
+        len(comment),
+    )
+    return comment
+
+
 def check_post_with_openai(
     post: Dict[str, Any],
     prompt: Union[str, Dict[str, Any]],

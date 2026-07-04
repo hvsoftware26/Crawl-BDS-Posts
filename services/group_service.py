@@ -3,7 +3,8 @@ import time
 from datetime import datetime
 from logging import getLogger
 
-from integrations.facebook_client import FacebookClient
+from integrations.facebook_client import FacebookClient, comment_post_as_random_page
+from integrations.openai_client import generate_comment_with_openai
 from services.post_service import (
     build_posts_status,
     check_posts_by_AI,
@@ -21,11 +22,15 @@ class GroupService:
         groups_list: list[str],
         delay_next_run: int,
         keywords: list[str],
+        recent_window_minutes: float = None,
         account_token: str = None,
         account_cookies: str = None,
+        account_name: str = None,
         proxies: dict = None,
         API_KEY: str = None,
         prompt: str = None,
+        prompt_cmt: str = None,
+        prompt_cmt_mode: str = "text",
         max_length_text: int = 500,
         progress_callback=None,
         status_callback=None,
@@ -35,11 +40,19 @@ class GroupService:
         self.facebook_client = FacebookClient(session=None) 
         self.groups_list = groups_list
         self.delay_next_run = delay_next_run * 60
+        self.recent_window_seconds = (
+            float(recent_window_minutes) * 60
+            if recent_window_minutes is not None
+            else self.delay_next_run
+        )
         self.keywords = keywords
         self.account_token = account_token
         self.account_cookies = account_cookies
+        self.account_name = account_name
         self.proxies = proxies
         self.prompt = prompt
+        self.prompt_cmt = prompt_cmt
+        self.prompt_cmt_mode = prompt_cmt_mode
         self.API_KEY = API_KEY
         self.max_length_text = max_length_text
         self.progress_callback = progress_callback
@@ -47,15 +60,128 @@ class GroupService:
         self.post_callback = post_callback
         self.stop_callback = stop_callback
         logger.debug(
-            "Initialized GroupService: groups=%s delay_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
+            "Initialized GroupService: groups=%s delay_seconds=%s recent_window_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
             len(groups_list or []),
             self.delay_next_run,
+            self.recent_window_seconds,
             len(keywords or []),
             bool(account_token),
             bool(account_cookies),
             bool(proxies),
             bool(API_KEY),
         )
+
+    def _is_fixed_comment_enabled(self) -> bool:
+        return (
+            str(self.prompt_cmt_mode or "text").strip().casefold() == "text"
+            and bool(str(self.prompt_cmt or "").strip())
+        )
+
+    def _is_ai_comment_enabled(self) -> bool:
+        return (
+            str(self.prompt_cmt_mode or "text").strip().casefold() == "ai"
+            and bool(str(self.prompt_cmt or "").strip())
+        )
+
+    def _build_comment_message_for_post(self, post: dict) -> tuple[str, str]:
+        comment_mode = str(self.prompt_cmt_mode or "text").strip().casefold()
+
+        if comment_mode == "ai":
+            if not self._is_ai_comment_enabled():
+                raise ValueError("Chưa có prompt comment AI")
+            if not self.API_KEY:
+                raise ValueError("Chưa có API key để tạo comment AI")
+
+            comment_message = generate_comment_with_openai(
+                post=post,
+                prompt=self.prompt_cmt,
+                api_key=self.API_KEY,
+                model="gpt-5-mini",
+                proxies=self.proxies,
+            )
+            return comment_message, "ai"
+
+        if not self._is_fixed_comment_enabled():
+            raise ValueError("Chưa có nội dung cmt sẵn")
+
+        return str(self.prompt_cmt or "").strip(), "text"
+
+    def _comment_valid_posts(self, posts_status: list[dict]) -> list[dict]:
+        if not posts_status:
+            return posts_status
+
+        valid_posts = [
+            post
+            for post in posts_status
+            if post.get("status") == 1 and post.get("id")
+        ]
+        if not valid_posts:
+            return posts_status
+
+        comment_mode = str(self.prompt_cmt_mode or "text").strip().casefold()
+        if comment_mode == "ai" and not self._is_ai_comment_enabled():
+            logger.info("Skip AI commenting because AI comment prompt is empty")
+            self.status_callback("Bỏ qua comment AI vì chưa có prompt")
+            return posts_status
+
+        if comment_mode == "text" and not self._is_fixed_comment_enabled():
+            logger.info("Skip commenting because fixed comment content is empty")
+            self.status_callback("Bỏ qua comment vì chưa có nội dung cmt sẵn")
+            return posts_status
+
+        if comment_mode == "ai" and not self.API_KEY:
+            logger.info("Skip AI commenting because OpenAI API key is empty")
+            self.status_callback("Bỏ qua comment AI vì chưa có API key")
+            return posts_status
+
+        if not self.account_token:
+            logger.info("Skip commenting because account token is empty")
+            self.status_callback("Bỏ qua comment vì chưa có token Facebook")
+            return posts_status
+
+        self.status_callback(f"Bắt đầu comment {len(valid_posts)} bài viết phù hợp")
+
+        for index, post in enumerate(valid_posts, start=1):
+            if self.stop_callback and self.stop_callback():
+                return posts_status
+
+            post_id = post.get("id")
+            try:
+                comment_message, comment_source = self._build_comment_message_for_post(post)
+                result = comment_post_as_random_page(
+                    post_url_or_id=post_id,
+                    message=comment_message,
+                    account_token=self.account_token,
+                    account_cookies=self.account_cookies,
+                    account_name=self.account_name,
+                    proxies=self.proxies,
+                )
+                post["comment_status"] = 1
+                post["comment_id"] = result.get("comment_id")
+                post["comment_page_id"] = result.get("page_id")
+                post["comment_page_name"] = result.get("page_name")
+                post["comment_message"] = comment_message
+                post["comment_source"] = comment_source
+                logger.info(
+                    "Commented valid post successfully: post_id=%s comment_id=%s page_name=%s",
+                    post_id,
+                    result.get("comment_id"),
+                    result.get("page_name"),
+                )
+                self.status_callback(
+                    "Đã comment %s/%s bài hợp lệ bằng page %s"
+                    % (index, len(valid_posts), result.get("page_name") or "")
+                )
+            except Exception as e:
+                post["comment_status"] = 0
+                post["comment_error"] = str(e)
+                logger.exception("Failed to comment valid post_id=%s: %s", post_id, e)
+                self.status_callback("Comment thất bại bài %s/%s" % (index, len(valid_posts)))
+
+            if not self.sleep_with_stop(1):
+                return posts_status
+
+        return posts_status
 
     def sleep_with_stop(self, seconds: float):
         for _ in range(int(seconds * 10)):
@@ -70,7 +196,7 @@ class GroupService:
             for post in posts
             if is_created_time_within_delay_window(
                 post.get("created_time"),
-                self.delay_next_run,
+                self.recent_window_seconds,
                 now=reference_time,
             )
         ]
@@ -87,7 +213,7 @@ class GroupService:
             post.get("created_time")
             and not is_created_time_within_delay_window(
                 post.get("created_time"),
-                self.delay_next_run,
+                self.recent_window_seconds,
                 now=reference_time,
             )
             for post in posts
@@ -135,10 +261,11 @@ class GroupService:
         consecutive_pages_without_new_posts = 0
         reference_time = datetime.now(HANOI_TIMEZONE)
         logger.info(
-            "Start collecting recent posts: group_id=%s reference_time=%s delay_seconds=%s",
+            "Start collecting recent posts: group_id=%s reference_time=%s delay_seconds=%s recent_window_seconds=%s",
             group_id,
             reference_time.isoformat(),
             self.delay_next_run,
+            self.recent_window_seconds,
         )
         self.status_callback('Bắt đầu thu thập bài viết')
         if not self.sleep_with_stop(1):
@@ -339,6 +466,7 @@ class GroupService:
                     group_id=res_posts.get("group_id"),
                     stop_callback = self.stop_callback,
                 )
+                posts_status = self._comment_valid_posts(posts_status)
 
                 logger.info(
                     "Prepared %s posts for JSON output from group %s",
@@ -370,7 +498,10 @@ class GroupService:
                             group_id,
                             self.delay_next_run,
                         )
-                        if not self.sleep_with_stop(5):
+                        self.status_callback(f"Tạm nghỉ {self.delay_next_run // 60} phút")
+                        if not self.sleep_with_stop(1):
+                            return
+                        if not self.sleep_with_stop(self.delay_next_run):
                             return
 
                     continue

@@ -1,17 +1,78 @@
-import requests
+from __future__ import annotations
 
-def Get_Towfa(twofa):
-    headers = {"accept": "*/*","accept-language": "en-US,en;q=0.9,vi;q=0.8","if-none-match": 'W/"12-XJOQd8Q1O2etfs04UznlJmRH/0c"',"priority": "u=1, i","referer": "https://2fa.live/","sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',"sec-ch-ua-mobile": "?0","sec-ch-ua-platform": '"Windows"',"sec-fetch-dest": "empty","sec-fetch-mode": "cors","sec-fetch-site": "same-origin","user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36","cookie": "_ga=GA1.1.472578041.1775374886; _ga_R2SB88WPTD=GS2.1.s1775374886$o1$g1$t1775375885$j60$l0$h0",}
+import base64
+import hashlib
+import hmac
+import re
+import struct
+import time
+from urllib.parse import parse_qs, urlparse
 
+
+DEFAULT_PERIOD_SECONDS = 30
+DEFAULT_DIGITS = 6
+DEFAULT_MIN_SECONDS_REMAINING = 8
+
+
+def _extract_secret(twofa: str) -> str:
+    value = str(twofa or "").strip()
+    if not value:
+        raise ValueError("Missing 2FA secret")
+
+    if value.lower().startswith("otpauth://"):
+        parsed = urlparse(value)
+        value = parse_qs(parsed.query).get("secret", [""])[0]
+
+    value = re.sub(r"[\s-]+", "", value).rstrip("=")
+    if not value:
+        raise ValueError("Missing 2FA secret")
+
+    return value.upper()
+
+
+def _decode_base32_secret(secret: str) -> bytes:
+    normalized_secret = _extract_secret(secret)
+    padding = "=" * ((8 - len(normalized_secret) % 8) % 8)
+    return base64.b32decode(normalized_secret + padding, casefold=True)
+
+
+def seconds_remaining(period: int = DEFAULT_PERIOD_SECONDS, now: float | None = None) -> float:
+    current_time = time.time() if now is None else float(now)
+    remaining = period - (current_time % period)
+    return period if remaining <= 0 else remaining
+
+
+def generate_totp(
+    twofa: str,
+    for_time: float | None = None,
+    period: int = DEFAULT_PERIOD_SECONDS,
+    digits: int = DEFAULT_DIGITS,
+) -> str:
+    key = _decode_base32_secret(twofa)
+    current_time = time.time() if for_time is None else float(for_time)
+    counter = int(current_time // period)
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code_int = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(code_int % (10**digits)).zfill(digits)
+
+
+def Get_Towfa(
+    twofa: str,
+    min_seconds_remaining: int = DEFAULT_MIN_SECONDS_REMAINING,
+    period: int = DEFAULT_PERIOD_SECONDS,
+):
+    """
+    Backward-compatible name used by the old code.
+    Generates the TOTP locally instead of depending on 2fa.live.
+    """
     try:
-        response = requests.get(f"https://2fa.live/tok/{twofa}",headers=headers,timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        token = data.get("token")
-        if not token:
-            print(f"Không lấy được token 2FA, response: {data}")
-            return False
-        return token
+        remaining = seconds_remaining(period)
+        if 0 < remaining < min_seconds_remaining:
+            time.sleep(remaining + 0.25)
+
+        return generate_totp(twofa, period=period)
     except Exception as e:
-        print(f"Lỗi lấy 2FA: {e}")
+        print(f"Loi lay 2FA: {e}")
         return False

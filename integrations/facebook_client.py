@@ -1,11 +1,328 @@
 from logging import getLogger
+import random
 import re
 import time
 import requests
+from urllib.parse import parse_qs, urlparse
 
 from app_config import build_headers, build_params
 
 logger = getLogger(__name__)
+
+
+def _create_graph_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+def _extract_facebook_post_id(post_url_or_id: str) -> str:
+    post_value = str(post_url_or_id or "").strip()
+    if not post_value:
+        raise ValueError("post_url_or_id is required")
+
+    if re.fullmatch(r"[A-Za-z0-9_]+", post_value):
+        return post_value
+
+    parsed_url = urlparse(post_value)
+    query = parse_qs(parsed_url.query)
+    path_segments = [segment for segment in parsed_url.path.split("/") if segment]
+
+    story_fbid = (query.get("story_fbid") or query.get("fbid") or [None])[0]
+    owner_id = (query.get("id") or [None])[0]
+    if story_fbid and owner_id:
+        return f"{owner_id}_{story_fbid}"
+
+    if "groups" in path_segments and "posts" in path_segments:
+        group_index = path_segments.index("groups")
+        posts_index = path_segments.index("posts")
+        if len(path_segments) > group_index + 1 and len(path_segments) > posts_index + 1:
+            group_id = path_segments[group_index + 1]
+            post_id = path_segments[posts_index + 1]
+            if group_id.isdigit() and post_id:
+                return f"{group_id}_{post_id}"
+            return post_id
+
+    for marker in ("posts", "videos", "photos"):
+        if marker in path_segments:
+            marker_index = path_segments.index(marker)
+            if len(path_segments) > marker_index + 1:
+                return path_segments[marker_index + 1]
+
+    raise ValueError(
+        "Không tách được post id. Hãy truyền dạng object_id, ví dụ groupid_postid hoặc pageid_postid."
+    )
+
+
+def _build_facebook_post_link(original_post_value: str, post_id: str) -> str:
+    original_value = str(original_post_value or "").strip()
+    if original_value.startswith(("http://", "https://")):
+        return original_value
+    return f"https://www.facebook.com/{post_id}"
+
+
+def _raise_graph_payload_error(payload: dict, context: str):
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not error:
+        return
+
+    message = error.get("message", "Unknown Facebook API error")
+    code = error.get("code")
+    subcode = error.get("error_subcode")
+    raise Exception(f"{context}: {message} (code={code}, subcode={subcode})")
+
+
+def _extract_cookie_value(cookies: str, name: str) -> str:
+    wanted_name = str(name or "").strip()
+    if not wanted_name:
+        return ""
+
+    for part in str(cookies or "").split(";"):
+        key, separator, value = part.strip().partition("=")
+        if separator and key.strip() == wanted_name:
+            return value.strip()
+
+    return ""
+
+
+def _normalize_page_identity(value: str) -> str:
+    return " ".join(str(value or "").split()).strip().casefold()
+
+
+def _is_main_profile_identity(page: dict, account_cookies: str, account_name: str = "") -> bool:
+    page_id = str(page.get("id") or "").strip()
+    page_name = _normalize_page_identity(page.get("name") or "")
+    profile_id = _extract_cookie_value(account_cookies, "c_user")
+    profile_name = _normalize_page_identity(account_name)
+
+    if profile_id and page_id == profile_id:
+        return True
+
+    if profile_name and page_name == profile_name:
+        return True
+
+    return False
+
+
+def _get_managed_pages_with_tokens(
+    account_token: str,
+    account_cookies: str = "",
+    account_name: str = "",
+    session: requests.Session | None = None,
+    proxies: dict = None,
+) -> list[dict]:
+    if not account_token:
+        raise ValueError("account_token is required")
+
+    http = session or _create_graph_session()
+    url = "https://graph.facebook.com/v22.0/me/accounts"
+    params = {
+        "fields": "id,name,access_token,category,tasks",
+        "limit": 100,
+        "access_token": account_token,
+    }
+    headers = {"cookie": account_cookies} if account_cookies else None
+    pages = []
+
+    while url:
+        response = http.get(
+            url,
+            params=params,
+            headers=headers,
+            proxies=proxies,
+            timeout=30,
+        )
+        params = None
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise Exception(f"Facebook trả về dữ liệu page không hợp lệ: {response.text}") from exc
+
+        _raise_graph_payload_error(payload, "Không lấy được danh sách page")
+
+        for page in payload.get("data", []) if isinstance(payload, dict) else []:
+            if page.get("id") and page.get("access_token"):
+                if _is_main_profile_identity(page, account_cookies, account_name):
+                    logger.info(
+                        "Skip main profile identity from page commenting: id=%s name=%s",
+                        page.get("id"),
+                        page.get("name"),
+                    )
+                    continue
+
+                pages.append(
+                    {
+                        "id": str(page.get("id")),
+                        "name": str(page.get("name") or ""),
+                        "access_token": str(page.get("access_token")),
+                    }
+                )
+
+        url = payload.get("paging", {}).get("next") if isinstance(payload, dict) else None
+
+    return pages
+
+
+def comment_post_as_random_page(
+    post_url_or_id: str,
+    message: str,
+    account_token: str,
+    account_cookies: str = "",
+    session: requests.Session | None = None,
+    proxies: dict = None,
+    randomizer: random.Random | None = None,
+    account_name: str = "",
+) -> dict:
+    """
+    Comment một bài Facebook bằng một page ngẫu nhiên mà account đang quản lý.
+
+    Lưu ý:
+    - `account_token` phải đọc được `/me/accounts` kèm `access_token` của page.
+    - `post_url_or_id` nên là Graph object id ổn định như `groupid_postid` hoặc `pageid_postid`.
+    - Hàm chỉ comment một lần cho một lời gọi; phần gọi bên ngoài quyết định tần suất.
+    """
+    comment_message = str(message or "").strip()
+    if not comment_message:
+        raise ValueError("message is required")
+
+    post_id = _extract_facebook_post_id(post_url_or_id)
+    http = session or _create_graph_session()
+    pages = _get_managed_pages_with_tokens(
+        account_token=account_token,
+        account_cookies=account_cookies,
+        account_name=account_name,
+        session=http,
+        proxies=proxies,
+    )
+    if not pages:
+        raise Exception("Account khong co page hop le de comment. Nick chinh da duoc loai khoi danh sach page.")
+
+    chooser = randomizer or random.SystemRandom()
+    selected_page = chooser.choice(pages)
+    response = http.post(
+        f"https://graph.facebook.com/v22.0/{post_id}/comments",
+        data={
+            "message": comment_message,
+            "access_token": selected_page["access_token"],
+        },
+        headers={"cookie": account_cookies} if account_cookies else None,
+        proxies=proxies,
+        timeout=30,
+    )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise Exception(f"Facebook trả về dữ liệu comment không hợp lệ: {response.text}") from exc
+
+    _raise_graph_payload_error(payload, "Comment bằng page thất bại")
+
+    comment_id = payload.get("id")
+    if not comment_id:
+        raise Exception(f"Facebook không trả về comment id: {payload}")
+
+    logger.info(
+        "Commented post as page: post_id=%s page_id=%s page_name=%s comment_id=%s",
+        post_id,
+        selected_page["id"],
+        selected_page["name"],
+        comment_id,
+    )
+
+    return {
+        "post_id": post_id,
+        "post_url": _build_facebook_post_link(post_url_or_id, post_id),
+        "comment_id": comment_id,
+        "page_id": selected_page["id"],
+        "page_name": selected_page["name"],
+    }
+
+def comment_post_as_page(
+    post_url_or_id: str,
+    message: str,
+    account_token: str,
+    account_cookies: str = "",
+    page_name: str = "",
+    page_id: str = "",
+    account_name: str = "",
+    session: requests.Session | None = None,
+    proxies: dict = None,
+) -> dict:
+    """
+    Comment một bài Facebook bằng page cụ thể theo `page_name` hoặc `page_id`.
+    """
+    comment_message = str(message or "").strip()
+    if not comment_message:
+        raise ValueError("message is required")
+
+    wanted_page_name = str(page_name or "").strip().casefold()
+    wanted_page_id = str(page_id or "").strip()
+    if not wanted_page_name and not wanted_page_id:
+        raise ValueError("page_name or page_id is required")
+
+    post_id = _extract_facebook_post_id(post_url_or_id)
+    http = session or _create_graph_session()
+    pages = _get_managed_pages_with_tokens(
+        account_token=account_token,
+        account_cookies=account_cookies,
+        account_name=account_name,
+        session=http,
+        proxies=proxies,
+    )
+    if not pages:
+        raise Exception("Account khong co page hop le de comment. Nick chinh da duoc loai khoi danh sach page.")
+
+    selected_page = None
+    for page in pages:
+        if wanted_page_id and str(page.get("id") or "").strip() == wanted_page_id:
+            selected_page = page
+            break
+        if wanted_page_name and str(page.get("name") or "").strip().casefold() == wanted_page_name:
+            selected_page = page
+            break
+
+    if selected_page is None:
+        available_pages = ", ".join(page.get("name") or page.get("id") or "" for page in pages)
+        raise Exception(f"Không tìm thấy page yêu cầu. Page hiện có: {available_pages}")
+
+    response = http.post(
+        f"https://graph.facebook.com/v22.0/{post_id}/comments",
+        data={
+            "message": comment_message,
+            "access_token": selected_page["access_token"],
+        },
+        headers={"cookie": account_cookies} if account_cookies else None,
+        proxies=proxies,
+        timeout=30,
+    )
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise Exception(f"Facebook trả về dữ liệu comment không hợp lệ: {response.text}") from exc
+
+    _raise_graph_payload_error(payload, "Comment bằng page thất bại")
+
+    comment_id = payload.get("id")
+    if not comment_id:
+        raise Exception(f"Facebook không trả về comment id: {payload}")
+
+    logger.info(
+        "Commented post as selected page: post_id=%s page_id=%s page_name=%s comment_id=%s",
+        post_id,
+        selected_page["id"],
+        selected_page["name"],
+        comment_id,
+    )
+
+    return {
+        "post_id": post_id,
+        "post_url": _build_facebook_post_link(post_url_or_id, post_id),
+        "comment_id": comment_id,
+        "page_id": selected_page["id"],
+        "page_name": selected_page["name"],
+    }
 
 
 def _sleep_with_stop(seconds: float, stop_callback=None) -> bool:
