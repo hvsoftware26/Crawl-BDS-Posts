@@ -3,6 +3,42 @@ from typing import Optional, List, Dict, Any
 from pathlib import Path
 from app_config import APP_BASE_DIR, PROFILE_ROOT_DIR
 
+STATUS_TEXT_MAP = {
+    "Chua ro": "Chưa rõ",
+    "Dang cho luong": "Đang chờ luồng",
+    "Dang khoi dong": "Đang khởi động",
+    "Dang kiem tra dang nhap": "Đang kiểm tra đăng nhập",
+    "Da dung": "Đã dừng",
+    "Da dang nhap": "Đã đăng nhập",
+    "Da dang xuat": "Đã đăng xuất",
+    "Khong vao duoc Facebook": "Không vào được Facebook",
+    "Khong lay duoc cookie/token": "Không lấy được cookie/token",
+    "Xu ly bai viet that bai": "Xử lý bài viết thất bại",
+}
+
+PROXY_TEXT_MAP = {
+    "Khong": "Không",
+}
+
+
+def format_status_text(status: str) -> str:
+    status_value = str(status or "").strip()
+    status_key = status_value.casefold()
+    for source_text, formatted_text in STATUS_TEXT_MAP.items():
+        if source_text.casefold() == status_key:
+            return formatted_text
+    return status_value
+
+
+def format_proxy_text(proxy: str) -> str:
+    proxy_value = str(proxy or "").strip()
+    proxy_key = proxy_value.casefold()
+    for source_text, formatted_text in PROXY_TEXT_MAP.items():
+        if source_text.casefold() == proxy_key:
+            return formatted_text
+    return proxy_value
+
+
 class AccountDB:
     def __init__(self, db_name: None):
         if db_name is None:
@@ -47,6 +83,15 @@ class AccountDB:
             conn.execute(query, (new_path, old_path))
             conn.commit()
 
+    def _rewrite_text_field(self, account_id: int, column_name: str, new_value: str):
+        if column_name not in {"Proxy", "Status"}:
+            return
+
+        query = f"UPDATE accounts SET {column_name} = ? WHERE id = ?"
+        with self._connect() as conn:
+            conn.execute(query, (new_value, account_id))
+            conn.commit()
+
     def _normalize_account_row(self, row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
@@ -58,6 +103,18 @@ class AccountDB:
         if normalized_path and normalized_path != original_path:
             self._rewrite_profile_path(original_path, normalized_path)
             row_dict["Path_Chrome"] = normalized_path
+
+        original_proxy = row_dict.get("Proxy") or ""
+        normalized_proxy = format_proxy_text(original_proxy)
+        if normalized_proxy != original_proxy:
+            self._rewrite_text_field(row_dict["id"], "Proxy", normalized_proxy)
+            row_dict["Proxy"] = normalized_proxy
+
+        original_status = row_dict.get("Status") or ""
+        normalized_status = format_status_text(original_status)
+        if normalized_status != original_status:
+            self._rewrite_text_field(row_dict["id"], "Status", normalized_status)
+            row_dict["Status"] = normalized_status
 
         return row_dict
 
@@ -74,12 +131,24 @@ class AccountDB:
             Cookie TEXT,
             Token TEXT,
             Status TEXT,
-            Post_Count INTEGER DEFAULT 0
+            Post_Count INTEGER DEFAULT 0,
+            Page_Count INTEGER DEFAULT 0,
+            Page_Names TEXT DEFAULT ''
         )
         """
         with self._connect() as conn:
             conn.execute(query)
+            self._ensure_column(conn, "accounts", "Page_Count", "INTEGER DEFAULT 0")
+            self._ensure_column(conn, "accounts", "Page_Names", "TEXT DEFAULT ''")
             conn.commit()
+
+    def _ensure_column(self, conn, table_name: str, column_name: str, column_definition: str):
+        columns = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
     def create_account(
         self,
@@ -116,13 +185,13 @@ class AccountDB:
                 (
                     account_name,
                     normalized_path,
-                    proxy,
+                    format_proxy_text(proxy),
                     email,
                     password,
                     twofa,
                     cookie,
                     token,
-                    status,
+                    format_status_text(status),
                     post_count,
                 ),
             )
@@ -170,7 +239,7 @@ class AccountDB:
                     (
                         account_name,
                         normalized_path,
-                        proxy,
+                        format_proxy_text(proxy),
                         email,
                         password,
                         twofa,
@@ -189,7 +258,7 @@ class AccountDB:
             twofa=twofa,
             cookie="",
             token="",
-            status="Chua ro",
+            status="Chưa rõ",
             post_count=0,
         )
         return "created"
@@ -271,6 +340,22 @@ class AccountDB:
             row_dict = self._normalize_account_row(row)
             return row_dict["Post_Count"]
 
+    def find_page_count_from_path_chrome(self, name_path: str) -> int:
+        query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
+            row_dict = self._normalize_account_row(row)
+            return int(row_dict.get("Page_Count") or 0)
+
+    def find_page_names_from_path_chrome(self, name_path: str) -> str:
+        query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
+            row_dict = self._normalize_account_row(row)
+            return row_dict.get("Page_Names") or ""
+
     def get_account_by_id(self, path_chrome: str) -> Optional[Dict[str, Any]]:
         query = "SELECT * FROM accounts WHERE id = ?"
         with self._connect() as conn:
@@ -290,6 +375,92 @@ class AccountDB:
             print(f"Lỗi update cookie/token: {e}")
             return False
         
+
+    def update_status_by_path(self, path_profile: str, status: str) -> bool:
+        query = """ UPDATE accounts SET Status = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        normalized_status = format_status_text(status)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(query, (normalized_status, normalized_path))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Lỗi update status: {e}")
+            return False
+
+    def mark_profile_logged_in(self, path_profile: str) -> bool:
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        if not normalized_path:
+            return False
+
+        profile_name = Path(normalized_path).name
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE accounts
+                    SET Path_Chrome = ?, Status = ?
+                    WHERE Path_Chrome = ?
+                    """,
+                    (normalized_path, "Đã đăng nhập", normalized_path),
+                )
+
+                if cursor.rowcount == 0 and profile_name:
+                    cursor = conn.execute(
+                        """
+                        UPDATE accounts
+                        SET Path_Chrome = ?, Status = ?
+                        WHERE Path_Chrome LIKE ?
+                        """,
+                        (normalized_path, "Đã đăng nhập", f"%\\{profile_name}"),
+                    )
+
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Lỗi mark profile logged in: {e}")
+            return False
+
+    def update_page_count_by_path(self, path_profile: str, page_count: int) -> bool:
+        query = """ UPDATE accounts SET Page_Count = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(query, (int(page_count or 0), normalized_path))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Lỗi update page count: {e}")
+            return False
+
+    def update_page_names_by_path(self, path_profile: str, page_names: str) -> bool:
+        query = """ UPDATE accounts SET Page_Names = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(query, (page_names or "", normalized_path))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Lỗi update page names: {e}")
+            return False
+
+    def update_page_info_by_path(self, path_profile: str, page_count: int, page_names: str) -> bool:
+        query = """ UPDATE accounts SET Page_Count = ?, Page_Names = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    query,
+                    (int(page_count or 0), page_names or "", normalized_path),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"Lỗi update page info: {e}")
+            return False
 
     def update_account(
         self,
@@ -320,10 +491,10 @@ class AccountDB:
                 (
                     account_name,
                     path_chrome,
-                    proxy,
+                    format_proxy_text(proxy),
                     email,
                     password,
-                    status,
+                    format_status_text(status),
                     post_count,
                     account_id,
                 ),
