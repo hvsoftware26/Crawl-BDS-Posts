@@ -27,13 +27,16 @@ logger = getLogger(__name__)
 class Worker_Handle(QThread):
     interaction_signal = pyqtSignal(int, str)
     row_signal = pyqtSignal(int, str)
+    page_signal = pyqtSignal(int, int)
+    page_names_signal = pyqtSignal(int, str)
     post_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(int, str)
 
-    def __init__(self, row: int, task: Info_data):
+    def __init__(self, row: int, task: Info_data, action_mode: str = "crawl"):
         super().__init__()
         self.row = row
         self.task = task
+        self.action_mode = action_mode
 
         self.playwright = None
         self.context = None
@@ -62,6 +65,16 @@ class Worker_Handle(QThread):
     def log_post(self, value: int):
         self.post_signal.emit(self.row, value)
         logger.info(f"[Row {self.row}] Post count: {value}")
+
+    def log_page_count(self, value: int):
+        self.page_signal.emit(self.row, value)
+        logger.info(f"[Row {self.row}] Page count: {value}")
+
+    def log_page_names(self, page_names: list[str]):
+        names_text = "\n".join(page_names or [])
+        self.page_names_signal.emit(self.row, names_text)
+        if page_names:
+            logger.info(f"[Row {self.row}] Page names: {', '.join(page_names[:20])}")
 
     # =========================
     # Stop helpers
@@ -113,6 +126,8 @@ class Worker_Handle(QThread):
                 executable_path=CHROME_PATH,
                 headless=True,
                 args=[
+                    "--headless=new",
+                    "--window-position=-32000,-32000",
                     "--window-size=600,540",
                     "--lang=vi-VN",
                     "--accept-lang=vi-VN,vi",
@@ -120,8 +135,11 @@ class Worker_Handle(QThread):
                     "--disable-infobars",
                     "--no-first-run",
                     "--no-default-browser-check",
+                    "--disable-gpu",
+                    "--disable-software-rasterizer",
+                    "--hide-scrollbars",
                     "--disable-dev-shm-usage",
-                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter",
                     "--disable-background-networking",
                     "--disable-background-timer-throttling",
                     "--disable-renderer-backgrounding",
@@ -335,6 +353,235 @@ class Worker_Handle(QThread):
                 return True
         return False
 
+    def find_first_visible_locator(self, selectors: list[str], timeout: int = 5000):
+        if self._stop_requested:
+            return None, None
+
+        deadline = time.monotonic() + (timeout / 1000)
+        while time.monotonic() < deadline:
+            if self._stop_requested:
+                return None, None
+
+            for selector in selectors:
+                remaining_ms = int((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    return None, None
+
+                try:
+                    locator = self.page.locator(selector).first
+                    locator.wait_for(state="visible", timeout=min(250, remaining_ms))
+                    return locator, selector
+                except Exception:
+                    continue
+
+            if not self.sleep_with_stop(0.2):
+                return None, None
+
+        return None, None
+
+    def page_text_contains_any(self, words: list[str], timeout: int = 1500) -> bool:
+        try:
+            body_text = self.page.locator("body").inner_text(timeout=timeout).lower()
+        except Exception:
+            return False
+
+        return any(word.lower() in body_text for word in words)
+
+    def page_looks_like_2fa_challenge(self) -> bool:
+        current_url = (self.page.url or "").lower()
+        if any(
+            marker in current_url
+            for marker in (
+                "checkpoint",
+                "two_factor",
+                "two-factor",
+                "two_step",
+                "two-step",
+                "login/approvals",
+            )
+        ):
+            return True
+
+        return self.page_text_contains_any(
+            [
+                "two-factor",
+                "authentication code",
+                "security code",
+                "login code",
+                "code generator",
+                "enter the code",
+                "nhập mã",
+                "ma xac thuc",
+                "mã xác thực",
+                "mã bảo mật",
+            ]
+        )
+
+    def find_2fa_input(self, timeout: int = 10000):
+        specific_selectors = [
+            'input[name="approvals_code"]',
+            'input#approvals_code',
+            'input[autocomplete="one-time-code"]',
+            'input[inputmode="numeric"]',
+            'input[type="tel"]',
+            'input[aria-label*="code" i]',
+            'input[placeholder*="code" i]',
+            'input[aria-label*="mã" i]',
+            'input[placeholder*="mã" i]',
+            "xpath=/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[2]/div[1]/div[4]/span/span/div/div[2]/div/div/div/div[1]/div[2]/div/div/input",
+            "xpath=/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[2]/div[2]/div[3]/div/div/div[3]/div/div/div[1]/input",
+        ]
+        locator, selector = self.find_first_visible_locator(specific_selectors, timeout=timeout)
+        if locator:
+            return locator, selector
+
+        if not self.page_looks_like_2fa_challenge():
+            return None, None
+
+        generic_selectors = [
+            'input[type="text"][maxlength="6"]',
+            'input[type="text"][maxlength="8"]',
+            'input[type="text"]',
+        ]
+        return self.find_first_visible_locator(generic_selectors, timeout=2000)
+
+    def has_2fa_challenge(self) -> bool:
+        locator, _ = self.find_2fa_input(timeout=1200)
+        return bool(locator)
+
+    def fill_2fa_code(self, input_locator, code: str) -> bool:
+        try:
+            digit_inputs = self.page.locator(
+                'input[maxlength="1"], input[aria-label*="digit" i], input[aria-label*="Digit" i]'
+            )
+            visible_digit_inputs = []
+            for index in range(min(digit_inputs.count(), len(code))):
+                item = digit_inputs.nth(index)
+                try:
+                    if item.is_visible():
+                        visible_digit_inputs.append(item)
+                except Exception:
+                    continue
+
+            if len(visible_digit_inputs) >= len(code):
+                for digit, item in zip(code, visible_digit_inputs):
+                    item.fill(digit)
+                return True
+        except Exception:
+            pass
+
+        try:
+            input_locator.scroll_into_view_if_needed()
+            input_locator.fill(str(code))
+            return True
+        except Exception:
+            try:
+                input_locator.click()
+                input_locator.type(str(code), delay=40)
+                return True
+            except Exception as e:
+                logger.error(f"[Row {self.row}] Loi nhap ma 2FA: {e}")
+                return False
+
+    def submit_2fa_code(self) -> bool:
+        submit_selectors = [
+            'button[type="submit"]',
+            'div[role="button"]:has-text("Continue")',
+            'button:has-text("Continue")',
+            'text="Continue"',
+            'div[role="button"]:has-text("Tiếp tục")',
+            'button:has-text("Tiếp tục")',
+            'text="Tiếp tục"',
+            "xpath=/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[3]/div[2]/div/div",
+            "xpath=/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[3]/div/div/div/div/div/div[2]/div[2]/div/div",
+        ]
+
+        if self.click_first_visible(submit_selectors, timeout=5000):
+            return True
+
+        try:
+            self.page.keyboard.press("Enter")
+            return True
+        except Exception as e:
+            logger.error(f"[Row {self.row}] Khong submit duoc ma 2FA: {e}")
+            return False
+
+    def click_post_login_prompts(self):
+        prompt_selectors = [
+            'div[role="button"]:has-text("Continue")',
+            'button:has-text("Continue")',
+            'text="Continue"',
+            'div[role="button"]:has-text("Tiếp tục")',
+            'button:has-text("Tiếp tục")',
+            'text="Tiếp tục"',
+            'div[role="button"]:has-text("OK")',
+            'button:has-text("OK")',
+        ]
+
+        for _ in range(3):
+            if self.click_first_visible(prompt_selectors, timeout=1000):
+                if not self.sleep_with_stop(0.6):
+                    return
+            else:
+                return
+
+    def handle_2fa_challenge(self) -> bool:
+        if self._stop_requested:
+            return False
+
+        self.log_row("Kiem tra xac minh 2FA")
+        input_locator, selector = self.find_2fa_input(timeout=15000)
+        if not input_locator:
+            self.log_row("Khong phat hien form 2FA")
+            return True
+
+        self.log_row(f"Phat hien form 2FA: {selector}")
+
+        twofa_secret = getattr(self.task, "twofa", "")
+        if not twofa_secret:
+            self.log_row("Tai khoan chua co secret 2FA")
+            return False
+
+        twofa_code = Get_Towfa(twofa_secret, min_seconds_remaining=8)
+        if not twofa_code:
+            self.log_row("Khong lay duoc ma 2FA")
+            return False
+
+        self.log_row(f"Ma 2FA: {twofa_code}")
+        if not self.fill_2fa_code(input_locator, str(twofa_code)):
+            self.log_row("Khong nhap duoc ma 2FA")
+            return False
+
+        if not self.sleep_with_stop(0.8):
+            return False
+
+        if not self.submit_2fa_code():
+            self.log_row("Khong submit duoc ma 2FA")
+            return False
+
+        self.log_row("Da submit ma 2FA, dang cho Facebook xac nhan")
+
+        for _ in range(15):
+            if self._stop_requested:
+                return False
+
+            self.click_post_login_prompts()
+            if self.is_logged_in():
+                self.log_row("Xac minh 2FA thanh cong")
+                return True
+
+            if not self.has_2fa_challenge():
+                return True
+
+            if not self.sleep_with_stop(1):
+                return False
+
+        if self.has_2fa_challenge():
+            self.log_row("Form 2FA van hien thi sau khi submit, co the ma da het han hoac bi tu choi")
+            return False
+
+        return True
+
     def fill_login_form(self) -> bool:
         filled_any = False
 
@@ -411,6 +658,14 @@ class Worker_Handle(QThread):
             if not self.sleep_with_stop(2):
                 return False
 
+        if self.has_2fa_challenge():
+            self.log_row("Phat hien yeu cau 2FA trong luong dang nhap")
+            if not self.handle_2fa_if_present():
+                return False
+            if not self.sleep_with_stop(2):
+                return False
+            return self.is_logged_in()
+
         filled_login_form = self.fill_login_form()
 
         if not filled_login_form and not clicked_continue:
@@ -445,6 +700,8 @@ class Worker_Handle(QThread):
     def handle_2fa_if_present(self) -> bool:
         if self._stop_requested:
             return False
+
+        return self.handle_2fa_challenge()
 
         twofa_layouts = [
             {
@@ -549,14 +806,18 @@ class Worker_Handle(QThread):
         try:
             current_url = (self.page.url or "").lower()
             has_session = self.has_active_facebook_session()
+            is_auth_challenge = any(
+                marker in current_url
+                for marker in (
+                    "login",
+                    "checkpoint",
+                    "two_factor",
+                    "two-factor",
+                    "recover",
+                )
+            )
 
-            if (
-                has_session
-                and "login" not in current_url
-                and "checkpoint" not in current_url
-                and "two_factor" not in current_url
-                and "recover" not in current_url
-            ):
+            if has_session and not is_auth_challenge:
                 return True
 
             if self.is_css_visible('input[name="email"]', timeout=2000):
@@ -571,9 +832,17 @@ class Worker_Handle(QThread):
                 )
                 return False
 
-            body = self.page.locator("body")
-            body.wait_for(state="visible", timeout=5000)
-            body_text = body.inner_text(timeout=5000).lower()
+            try:
+                body_text = self.page.locator("body").inner_text(timeout=2500).lower()
+            except Exception as body_error:
+                logger.warning(
+                    "[Row %s] Khong doc duoc body khi kiem tra login: url=%s has_session=%s error=%s",
+                    self.row,
+                    current_url,
+                    has_session,
+                    body_error,
+                )
+                return has_session and not is_auth_challenge
 
             if (
                 "bạn đang nghĩ gì thế" in body_text
@@ -595,7 +864,10 @@ class Worker_Handle(QThread):
             return has_session
         except Exception as e:
             logger.error(f"[Row {self.row}] Lỗi kiểm tra login: {e}")
-            return False
+            try:
+                return self.has_active_facebook_session()
+            except Exception:
+                return False
 
     def handle_login(self):
         browser_retry = 3
@@ -777,6 +1049,368 @@ class Worker_Handle(QThread):
         self.log_row("Lấy cookie và token thất bại sau nhiều lần thử")
         return None, None
 
+    @staticmethod
+    def _normalize_page_name(name: str) -> str:
+        return " ".join(str(name or "").split()).strip()
+
+    def _dedupe_page_names(self, names: list[str]) -> list[str]:
+        unique_names = []
+        seen = set()
+
+        for name in names or []:
+            normalized_name = self._normalize_page_name(name)
+            if not normalized_name:
+                continue
+
+            key = normalized_name.casefold()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            unique_names.append(normalized_name)
+
+        return unique_names
+
+    def fetch_page_names_from_graph(self, token: str = None, cookie: str = None) -> list[str] | None:
+        access_token = token or self.eaag_token or getattr(self.task, "token", "")
+        cookie_value = cookie or self.cookie_raw or getattr(self.task, "cookie", "")
+        if not access_token:
+            logger.info("[Row %s] Skip page names from Graph because token is empty", self.row)
+            return None
+
+        url = "https://graph.facebook.com/v22.0/me/accounts"
+        params = {
+            "fields": "id,name",
+            "limit": 100,
+            "access_token": access_token,
+        }
+        headers = {"cookie": cookie_value} if cookie_value else None
+        page_names = []
+
+        while url and not self._stop_requested:
+            try:
+                response = requests.get(url, params=params, headers=headers, timeout=30)
+                params = None
+                payload = response.json()
+            except Exception as e:
+                logger.warning("[Row %s] Không lấy được danh sách page từ Graph: %s", self.row, e)
+                return None
+
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if error:
+                logger.warning("[Row %s] Facebook page names error: %s", self.row, error)
+                return None
+
+            page_items = payload.get("data", []) if isinstance(payload, dict) else []
+            for page_item in page_items:
+                if isinstance(page_item, dict):
+                    page_names.append(page_item.get("name", ""))
+
+            url = payload.get("paging", {}).get("next") if isinstance(payload, dict) else None
+
+        return self._dedupe_page_names(page_names)
+
+    def fetch_total_pages(self, token: str = None, cookie: str = None) -> int | None:
+        page_names = self.fetch_page_names_from_graph(token, cookie)
+        if page_names is None:
+            return None
+
+        return len(page_names)
+
+    def _extract_page_names_from_current_dom(self) -> list[str]:
+        if not self.page:
+            return []
+
+        try:
+            names = self.page.evaluate(
+                """
+                () => {
+                    const blockedTexts = new Set([
+                        "facebook", "home", "trang chủ", "pages", "trang",
+                        "friends", "bạn bè", "groups", "nhóm", "marketplace",
+                        "watch", "video", "reels", "menu", "notifications",
+                        "thông báo", "messenger", "search", "tìm kiếm",
+                        "settings", "cài đặt", "see more", "xem thêm",
+                        "create new page", "tạo trang mới", "create page",
+                        "tạo trang", "manage", "quản lý", "switch", "chuyển",
+                        "meta business suite", "feeds", "bảng feed"
+                    ]);
+                    const blockedPathStarts = new Set([
+                        "pages", "groups", "friends", "marketplace", "watch",
+                        "notifications", "messages", "help", "settings",
+                        "privacy", "events", "gaming", "reel", "reels",
+                        "stories", "search", "bookmarks", "business", "ads",
+                        "me", "profile"
+                    ]);
+
+                    const cleanText = (value) => String(value || "")
+                        .replace(/\\s+/g, " ")
+                        .trim();
+
+                    const hasPageContext = (node) => {
+                        let current = node;
+                        for (let depth = 0; current && depth < 8; depth += 1) {
+                            const contextText = cleanText(current.innerText || current.textContent || "");
+                            if (/followers?|người theo dõi|likes?|lượt thích|manage|quản lý|switch|chuyển|page|trang/i.test(contextText)) {
+                                return true;
+                            }
+                            current = current.parentElement;
+                        }
+                        return false;
+                    };
+
+                    const isUsableName = (name) => {
+                        const text = cleanText(name);
+                        if (!text || text.length < 2 || text.length > 120) {
+                            return false;
+                        }
+                        if (blockedTexts.has(text.toLowerCase())) {
+                            return false;
+                        }
+                        if (/^(\\d+[.,]?\\d*\\s*)?(followers?|người theo dõi|likes?|lượt thích)$/i.test(text)) {
+                            return false;
+                        }
+                        if (/^(manage|quản lý|switch|chuyển|view|xem|message|nhắn tin)$/i.test(text)) {
+                            return false;
+                        }
+                        return true;
+                    };
+
+                    const isProbablyPageHref = (href, node) => {
+                        if (!href) {
+                            return false;
+                        }
+
+                        let url;
+                        try {
+                            url = new URL(href, location.href);
+                        } catch (_) {
+                            return false;
+                        }
+
+                        if (!/(^|\\.)facebook\\.com$/i.test(url.hostname)) {
+                            return false;
+                        }
+
+                        const path = decodeURIComponent(url.pathname || "").replace(/\\/+$/, "");
+                        if (path === "/profile.php") {
+                            return url.searchParams.has("id") && hasPageContext(node);
+                        }
+
+                        const segments = path.split("/").filter(Boolean);
+                        if (segments.length === 0) {
+                            return false;
+                        }
+
+                        if (blockedPathStarts.has((segments[0] || "").toLowerCase())) {
+                            return false;
+                        }
+
+                        return hasPageContext(node);
+                    };
+
+                    const result = [];
+                    for (const anchor of Array.from(document.querySelectorAll('a[href]'))) {
+                        if (!isProbablyPageHref(anchor.href, anchor)) {
+                            continue;
+                        }
+
+                        const label = cleanText(anchor.getAttribute("aria-label"));
+                        const rawText = cleanText(anchor.innerText || anchor.textContent);
+                        const firstLine = cleanText((anchor.innerText || anchor.textContent || "").split("\\n")[0]);
+                        const candidates = [firstLine, label, rawText];
+
+                        for (const candidate of candidates) {
+                            if (isUsableName(candidate)) {
+                                result.push(candidate);
+                                break;
+                            }
+                        }
+                    }
+
+                    return result;
+                }
+                """
+            )
+        except Exception as e:
+            logger.warning("[Row %s] Không đọc được DOM page Facebook: %s", self.row, e)
+            return []
+
+        return self._dedupe_page_names(names or [])
+
+    def fetch_page_names_from_html(self) -> list[str] | None:
+        urls = [
+            "https://www.facebook.com/pages/?category=your_pages&ref=bookmarks",
+            "https://www.facebook.com/pages/?category=your_pages",
+            "https://www.facebook.com/bookmarks/pages",
+            "https://m.facebook.com/pages/?category=your_pages",
+        ]
+        page_names = []
+
+        try:
+            self._start_browser()
+            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded", retry=1):
+                return None
+
+            if not self.sleep_with_stop(2):
+                return None
+
+            if not self.is_logged_in():
+                self.log_row("Không thể đọc tên page bằng HTML vì profile chưa đăng nhập")
+                return None
+
+            for url in urls:
+                if self._stop_requested:
+                    return None
+
+                self.log_row(f"Đọc danh sách page từ HTML: {url}")
+                if not self.safe_goto(url, wait_until="domcontentloaded", retry=1):
+                    continue
+
+                if not self.sleep_with_stop(3):
+                    return None
+
+                for _ in range(6):
+                    page_names.extend(self._extract_page_names_from_current_dom())
+                    try:
+                        self.page.mouse.wheel(0, 1400)
+                    except Exception:
+                        pass
+
+                    if not self.sleep_with_stop(1):
+                        return None
+
+            page_names = self._dedupe_page_names(page_names)
+            return page_names if page_names else None
+        finally:
+            self.close()
+
+    def persist_account_status(
+        self,
+        status: str,
+        page_count: int | None = None,
+        page_names: list[str] | None = None,
+    ):
+        db = AccountDB(None)
+        db.update_status_by_path(self.task.path_chrome, status)
+        if page_names is not None:
+            page_names = self._dedupe_page_names(page_names)
+            resolved_page_count = len(page_names) if page_count is None else page_count
+            db.update_page_info_by_path(
+                self.task.path_chrome,
+                resolved_page_count,
+                "\n".join(page_names),
+            )
+            self.log_page_count(resolved_page_count)
+            self.log_page_names(page_names)
+        elif page_count is not None:
+            db.update_page_count_by_path(self.task.path_chrome, page_count)
+            self.log_page_count(page_count)
+
+    def run_check_login(self) -> str:
+        self.log_row("Đang kiểm tra đăng nhập")
+        logged_in = False
+
+        try:
+            self._start_browser()
+            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+                self.persist_account_status("Không vào được Facebook")
+                return "Không vào được Facebook"
+
+            if not self.sleep_with_stop(2):
+                return "Đã dừng"
+
+            logged_in = self.is_logged_in()
+            self.cookie_raw = self.get_cookie_raw() if self.context else getattr(self.task, "cookie", "")
+        finally:
+            self.close()
+
+        if self._stop_requested:
+            return "Đã dừng"
+
+        if not logged_in:
+            self.persist_account_status("Đã đăng xuất")
+            return "Đã đăng xuất"
+
+        page_names = self.fetch_page_names_from_graph(getattr(self.task, "token", ""), self.cookie_raw)
+        if not page_names:
+            page_names = self.fetch_page_names_from_html()
+
+        if page_names is None:
+            self.persist_account_status("Đã đăng nhập")
+            self.log_row("Đã đăng nhập, nhưng chưa lấy được danh sách page")
+        else:
+            self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
+            self.log_row(f"Đã cập nhật {len(page_names)} page")
+
+        return "Đã đăng nhập"
+
+    def run_refresh_page_names(self) -> str:
+        self.log_row("Đang cập nhật tên page")
+        logged_in = False
+
+        try:
+            self._start_browser()
+            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+                self.persist_account_status("Không vào được Facebook")
+                return "Không vào được Facebook"
+
+            if not self.sleep_with_stop(2):
+                return "Đã dừng"
+
+            logged_in = self.is_logged_in()
+            self.cookie_raw = self.get_cookie_raw() if self.context else getattr(self.task, "cookie", "")
+        finally:
+            self.close()
+
+        if self._stop_requested:
+            return "Đã dừng"
+
+        if not logged_in:
+            self.persist_account_status("Đã đăng xuất")
+            return "Đã đăng xuất"
+
+        page_names = self.fetch_page_names_from_graph(getattr(self.task, "token", ""), self.cookie_raw)
+        if not page_names:
+            page_names = self.fetch_page_names_from_html()
+
+        if page_names is None:
+            page_names = []
+
+        self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
+        if page_names:
+            self.log_row(f"Đã cập nhật {len(page_names)} page")
+        else:
+            self.log_row("Đã cập nhật: profile hiện chưa có page")
+
+        return "Đã cập nhật tên page"
+
+    def run_refresh_login_data(self) -> str:
+        self.log_row("Đang cập nhật cookie/token và số page")
+
+        cookie, token = self.handle_login()
+
+        if self._stop_requested:
+            return "Đã dừng"
+
+        page_names = None
+        if cookie and token:
+            page_names = self.fetch_page_names_from_graph(token, cookie)
+        else:
+            self.log_row("Chưa lấy được cookie/token, chuyển sang đọc tên page bằng HTML")
+
+        if not page_names:
+            page_names = self.fetch_page_names_from_html()
+
+        if page_names is None:
+            AccountDB(None).update_status_by_path(self.task.path_chrome, "Đã đăng nhập")
+            self.log_row("Đã lưu trạng thái đăng nhập, nhưng chưa lấy được danh sách page")
+        else:
+            self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
+            self.log_row(f"Đã cập nhật {len(page_names)} page")
+
+        return "Đã đăng nhập"
+
     # =========================
     # Scan flow
     # =========================
@@ -790,13 +1424,17 @@ class Worker_Handle(QThread):
         self.scanner = ScanController(
             groups_list=self.task.groups_list,
             delay=float(self.task.delay_get_post_gr),
+            recent_window_minutes=float(self.task.cycle_total or 0) * 60,
             keywords=self.task.keywords_list,
             API_KEY=self.task.api_key,
             account_token=self.eaag_token,
             account_cookies=self.cookie_raw,
+            account_name=self.task.account_name,
             token_tele=self.task.token_tele,
             idchat=self.task.id_chat,
             prompt=self.task.prompt,
+            prompt_cmt=self.task.prompt_cmt,
+            prompt_cmt_mode=self.task.prompt_cmt_mode,
             max_length_text=100000,
             progress_callback=self.log_interaction,
             status_callback=self.log_row,
@@ -822,6 +1460,29 @@ class Worker_Handle(QThread):
     # Main thread flow
     # =========================
     def run(self):
+        if self.action_mode not in ("crawl", "check_login", "refresh_login_data", "refresh_page_names"):
+            final_status = "Chức năng này không còn được hỗ trợ"
+            self.log_row(final_status)
+            self.finished_signal.emit(self.row, final_status)
+            return
+
+        if self.action_mode in ("check_login", "refresh_login_data", "refresh_page_names"):
+            final_status = "Đã dừng"
+            try:
+                if self.action_mode == "check_login":
+                    final_status = self.run_check_login()
+                elif self.action_mode == "refresh_login_data":
+                    final_status = self.run_refresh_login_data()
+                else:
+                    final_status = self.run_refresh_page_names()
+            except Exception as e:
+                logger.exception(f"[Row {self.row}] Lỗi cập nhật đăng nhập: {e}")
+                final_status = f"Lỗi: {e}"
+            finally:
+                self.close()
+                self.finished_signal.emit(self.row, final_status)
+            return
+
         final_status = "Đã dừng"
         cycle_index = 0
 
