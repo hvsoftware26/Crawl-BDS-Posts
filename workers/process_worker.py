@@ -6,12 +6,28 @@ import time
 import threading
 from logging import getLogger
 from controllers.scan_controller import ScanController
+from integrations.facebook_client import (
+    FacebookUidCheckNetworkError,
+    check_facebook_uid_status,
+    extract_facebook_uid_from_cookie,
+    get_account_profile_info,
+    get_managed_page_names,
+    resolve_facebook_uid,
+)
 from PyQt5.QtCore import QThread, pyqtSignal
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from services.sql_query_service import AccountDB
 from services.get_2fa import Get_Towfa
 from models.account import Info_data
 from app_config import CHROME_PATH
+from utils.proxy_utils import (
+    build_playwright_proxy,
+    build_requests_proxies,
+    mask_proxy,
+)
+from utils.facebook_cookies import has_facebook_login_cookie
+from utils.proxy_utils import verify_browser_proxy_ip
+from utils.security import mask_cookie, mask_secret
 
 logging.basicConfig(
     filename="main.log",
@@ -47,6 +63,7 @@ class Worker_Handle(QThread):
         self.response_captured = False
         self.cookie_raw = None
         self.eaag_token = None
+        self._capture_listening = False
 
         self._stop_requested = False
         self._playwright_thread_id = None
@@ -121,37 +138,52 @@ class Worker_Handle(QThread):
         self._playwright_thread_id = threading.get_ident()
         try:
             self.playwright = sync_playwright().start()
-            self.context = self.playwright.chromium.launch_persistent_context(
-                user_data_dir=self.task.path_chrome,
-                executable_path=CHROME_PATH,
-                headless=True,
-                args=[
-                    "--headless=new",
-                    "--window-position=-32000,-32000",
-                    "--window-size=600,540",
-                    "--lang=vi-VN",
-                    "--accept-lang=vi-VN,vi",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-gpu",
-                    "--disable-software-rasterizer",
-                    "--hide-scrollbars",
-                    "--disable-dev-shm-usage",
-                    "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-renderer-backgrounding",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-extensions",
-                    "--disable-sync",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-                    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-                ],
-            )
+            proxy_settings = build_playwright_proxy(getattr(self.task, "proxy", ""))
+            browser_args = [
+                "--headless=new",
+                "--window-position=-32000,-32000",
+                "--window-size=600,540",
+                "--lang=vi-VN",
+                "--accept-lang=vi-VN,vi",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--hide-scrollbars",
+                "--disable-dev-shm-usage",
+                "--disable-features=IsolateOrigins,site-per-process,CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter,DisableLoadExtensionCommandLineSwitch,UseDnsHttpsSvcb,EncryptedClientHello",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--disable-quic",
+                "--dns-prefetch-disable",
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--disable-extensions",
+            ]
+
+            launch_options = {
+                "user_data_dir": self.task.path_chrome,
+                "executable_path": CHROME_PATH,
+                "headless": True,
+                "args": browser_args,
+            }
+            if proxy_settings:
+                launch_options["proxy"] = proxy_settings
+                self.log_row(f"Đang dùng proxy Playwright: {mask_proxy(getattr(self.task, 'proxy', ''))}")
+
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_options)
+            # KHÔNG dùng context.route("**/*") ở đây. Với proxy có auth, mỗi request
+            # bị interception phải đi lại challenge 407 -> trang treo/quay mãi
+            # (đã xác nhận qua test.py). Bỏ resource-blocking để proxy auth hoạt động.
+            if proxy_settings:
+                self._verify_playwright_proxy(getattr(self.task, "proxy", ""))
         except Exception as e:
             error_message = str(e)
 
@@ -172,10 +204,38 @@ class Worker_Handle(QThread):
 
             raise
 
-        pages = self.context.pages
+        pages = [
+            page
+            for page in self.context.pages
+            if not (page.url or "").startswith("chrome-extension://")
+        ]
         self.page = pages[0] if pages else self.context.new_page()
         self.page.set_default_timeout(30000)
         self.page.set_default_navigation_timeout(20000)
+
+    def _verify_playwright_proxy(self, proxy_value: str):
+        check_pages = [
+            page
+            for page in self.context.pages
+            if not (page.url or "").startswith("chrome-extension://")
+        ]
+        check_page = check_pages[0] if check_pages else self.context.new_page()
+        result = verify_browser_proxy_ip(
+            check_page,
+            proxy_value,
+            timeout_ms=10000,
+            attempts=2,
+            delay_seconds=0.5,
+        )
+        origin = result.get("origin", "")
+        if not result.get("ok"):
+            source = result.get("source_url") or "unknown"
+            error = result.get("error") or "không đọc được IP"
+            if origin:
+                raise RuntimeError(f"Proxy Playwright chưa đúng IP. IP nhận được: {origin} (nguồn: {source})")
+            raise RuntimeError(f"Không kiểm tra được IP proxy Playwright: {error} (nguồn: {source})")
+
+        self.log_row(f"Proxy Playwright OK: {origin}")
 
     def close(self):
         if (
@@ -547,7 +607,7 @@ class Worker_Handle(QThread):
             self.log_row("Khong lay duoc ma 2FA")
             return False
 
-        self.log_row(f"Ma 2FA: {twofa_code}")
+        self.log_row("Da lay ma 2FA")
         if not self.fill_2fa_code(input_locator, str(twofa_code)):
             self.log_row("Khong nhap duoc ma 2FA")
             return False
@@ -742,7 +802,7 @@ class Worker_Handle(QThread):
                 self.log_row("Không lấy được mã 2FA")
                 return False
 
-            self.log_row(f"Mã 2FA: {twofa_code}")
+            self.log_row("Đã lấy mã 2FA")
 
         except Exception as e:
             logger.error(f"[Row {self.row}] Lỗi lấy mã 2FA: {e}")
@@ -774,7 +834,7 @@ class Worker_Handle(QThread):
             self.request_captured = True
             self.cookie_raw = self.get_cookie_raw()
             logger.info(f"[Row {self.row}] Bắt được request business_locations")
-            logger.info(f"[Row {self.row}] COOKIE: {self.cookie_raw}")
+            logger.info(f"[Row {self.row}] COOKIE: {mask_cookie(self.cookie_raw)}")
 
     def on_capture_response(self, response):
         if self.response_captured or self._stop_requested:
@@ -786,15 +846,32 @@ class Worker_Handle(QThread):
                 if '],["EAAGN' in text:
                     self.eaag_token = "EAAGN" + text.split('],["EAAGN')[1].split('","')[0]
                     self.response_captured = True
-                    logger.info(f"[Row {self.row}] Bắt được EAAG token")
+                    logger.info(f"[Row {self.row}] Bắt được EAAG token: {mask_secret(self.eaag_token)}")
         except Exception as e:
             logger.error(f"[Row {self.row}] Lỗi bắt response token: {e}")
 
     def start_capture(self):
         self.request_captured = False
         self.response_captured = False
+        if self._capture_listening:
+            return
         self.page.on("request", self.on_capture_requests)
         self.page.on("response", self.on_capture_response)
+        self._capture_listening = True
+
+    def stop_capture(self):
+        # Gỡ listener sau khi lấy xong cookie/token. Nếu để nguyên, mọi
+        # request/response của trang phải round-trip qua CDP về Python, làm
+        # các trang nặng (link post) lag khi thao tác tay.
+        if not self._capture_listening:
+            return
+        try:
+            self.page.remove_listener("request", self.on_capture_requests)
+            self.page.remove_listener("response", self.on_capture_response)
+        except Exception as e:
+            logger.warning(f"[Row {self.row}] Lỗi gỡ capture listener: {e}")
+        finally:
+            self._capture_listening = False
 
     # =========================
     # Login flow
@@ -869,7 +946,93 @@ class Worker_Handle(QThread):
             except Exception:
                 return False
 
-    def handle_login(self):
+    def try_reuse_saved_cookie_token(self):
+        saved_cookie = str(getattr(self.task, "cookie", "") or "").strip()
+        saved_token = str(getattr(self.task, "token", "") or "").strip()
+        if not saved_cookie or not saved_token:
+            return None
+
+        if not has_facebook_login_cookie(saved_cookie):
+            self.log_row("Cookie hiện tại thiếu c_user/xs, sẽ lấy lại cookie/token")
+            return None
+
+        try:
+            profile_info = get_account_profile_info(
+                saved_token,
+                account_cookies=saved_cookie,
+                proxies=build_requests_proxies(getattr(self.task, "proxy", "")),
+            )
+        except Exception as exc:
+            logger.info("[Row %s] Saved token/cookie is not reusable: %s", self.row, exc)
+            self.log_row(f"Token/cookie hiện tại không dùng được, sẽ lấy lại: {exc}")
+            return None
+
+        cookie_uid = extract_facebook_uid_from_cookie(saved_cookie)
+        token_uid = str(profile_info.get("id") or "").strip()
+        if cookie_uid and token_uid and cookie_uid != token_uid:
+            self.log_row("Token/cookie hiện tại không cùng UID, sẽ lấy lại cookie/token")
+            logger.info(
+                "[Row %s] Saved credential UID mismatch: cookie_uid=%s token_uid=%s",
+                self.row,
+                cookie_uid,
+                token_uid,
+            )
+            return None
+
+        self.cookie_raw = saved_cookie
+        self.eaag_token = saved_token
+        account_name = profile_info.get("name") or token_uid or cookie_uid
+        self.log_row(f"Token/cookie hiện tại còn dùng được: {account_name}")
+        return self.cookie_raw, self.eaag_token
+
+    def verify_account_active(self, cookie: str, token: str) -> bool:
+        """Check account còn hoạt động bằng cookie + token qua Graph API."""
+        if not cookie or not token:
+            return False
+        try:
+            get_account_profile_info(
+                token,
+                account_cookies=cookie,
+                proxies=build_requests_proxies(getattr(self.task, "proxy", "")),
+            )
+            return True
+        except Exception as exc:
+            logger.info("[Row %s] verify_account_active failed: %s", self.row, exc)
+            return False
+
+    def prepare_worker_account(self):
+        """
+        LUỒNG 2: kiểm tra tài khoản bằng cookie+token trước khi chạy worker.
+        - Hợp lệ  -> trả (cookie, token) để chạy tool ngay.
+        - Không hợp lệ -> refresh token (mở Chrome + Get_Towfa + capture),
+          recheck Graph. Được thì chạy tiếp, thất bại thì trả (None, None)
+          và caller sẽ đặt Status "Có thể nick bị đăng xuất".
+        """
+        reused = self.try_reuse_saved_cookie_token()
+        if reused:
+            return reused
+
+        if self._stop_requested:
+            return None, None
+
+        self.log_row("Có thể token đã hết hạn")
+        cookie, token = self.handle_login(skip_reuse=True)
+
+        if self._stop_requested:
+            return None, None
+
+        if cookie and token and self.verify_account_active(cookie, token):
+            self.log_row("Đã lấy token mới, tài khoản còn hoạt động")
+            return cookie, token
+
+        return None, None
+
+    def handle_login(self, skip_reuse: bool = False):
+        if not skip_reuse:
+            saved_credentials = self.try_reuse_saved_cookie_token()
+            if saved_credentials:
+                return saved_credentials
+
         browser_retry = 3
         capture_retry = 5
 
@@ -993,6 +1156,7 @@ class Worker_Handle(QThread):
                                 token=self.eaag_token,
                             )
                             self.log_row("Lấy cookie và token thành công")
+                            self.stop_capture()
                             return self.cookie_raw, self.eaag_token
 
                         self.log_row("Chưa lấy đủ cookie/token, sẽ thử lại")
@@ -1078,37 +1242,70 @@ class Worker_Handle(QThread):
             logger.info("[Row %s] Skip page names from Graph because token is empty", self.row)
             return None
 
-        url = "https://graph.facebook.com/v22.0/me/accounts"
-        params = {
-            "fields": "id,name",
-            "limit": 100,
-            "access_token": access_token,
-        }
-        headers = {"cookie": cookie_value} if cookie_value else None
-        page_names = []
+        try:
+            return self._dedupe_page_names(
+                get_managed_page_names(
+                    access_token,
+                    account_cookies=cookie_value,
+                    account_name=getattr(self.task, "account_name", ""),
+                    proxies=build_requests_proxies(getattr(self.task, "proxy", "")),
+                )
+            )
+        except Exception as e:
+            logger.warning("[Row %s] Không lấy được danh sách page từ Graph: %s", self.row, e)
+            return None
 
-        while url and not self._stop_requested:
+    def fetch_page_names_from_graph_with_fallback(self, token: str = None, cookie: str = None) -> list[str] | None:
+        access_token = token or self.eaag_token or getattr(self.task, "token", "")
+        cookie_value = cookie or self.cookie_raw or getattr(self.task, "cookie", "")
+        if not access_token:
+            logger.info("[Row %s] Skip page names from Graph because token is empty", self.row)
+            return None
+
+        proxy_value = getattr(self.task, "proxy", "")
+        attempts = []
+        try:
+            proxies = build_requests_proxies(proxy_value)
+        except Exception as exc:
+            logger.warning("[Row %s] Invalid Graph proxy, retry direct: %s", self.row, exc)
+            proxies = None
+
+        if proxies:
+            attempts.append(("proxy", proxies))
+        attempts.append(("direct", None))
+
+        last_error = None
+        for label, request_proxies in attempts:
+            if self._stop_requested:
+                return None
+
             try:
-                response = requests.get(url, params=params, headers=headers, timeout=30)
-                params = None
-                payload = response.json()
-            except Exception as e:
-                logger.warning("[Row %s] Không lấy được danh sách page từ Graph: %s", self.row, e)
-                return None
+                page_names = get_managed_page_names(
+                    access_token,
+                    account_cookies=cookie_value,
+                    account_name=getattr(self.task, "account_name", ""),
+                    proxies=request_proxies,
+                )
+                if label == "direct" and proxies:
+                    self.log_row("Proxy loi, da lay danh sach page bang ket noi direct")
+                return self._dedupe_page_names(page_names)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "[Row %s] Khong lay duoc danh sach page tu Graph %s: %s",
+                    self.row,
+                    label,
+                    exc,
+                )
+                if request_proxies is not None:
+                    self.log_row(f"Proxy loi khi lay page, thu lai khong dung proxy: {self._short_error(exc)}")
+                    continue
 
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if error:
-                logger.warning("[Row %s] Facebook page names error: %s", self.row, error)
-                return None
-
-            page_items = payload.get("data", []) if isinstance(payload, dict) else []
-            for page_item in page_items:
-                if isinstance(page_item, dict):
-                    page_names.append(page_item.get("name", ""))
-
-            url = payload.get("paging", {}).get("next") if isinstance(payload, dict) else None
-
-        return self._dedupe_page_names(page_names)
+        if last_error:
+            self.log_row(
+                f"Khong lay duoc danh sach page tu Graph API, giu nguyen du lieu cu: {self._short_error(last_error)}"
+            )
+        return None
 
     def fetch_total_pages(self, token: str = None, cookie: str = None) -> int | None:
         page_names = self.fetch_page_names_from_graph(token, cookie)
@@ -1307,83 +1504,88 @@ class Worker_Handle(QThread):
             db.update_page_count_by_path(self.task.path_chrome, page_count)
             self.log_page_count(page_count)
 
-    def run_check_login(self) -> str:
-        self.log_row("Đang kiểm tra đăng nhập")
-        logged_in = False
-
-        try:
-            self._start_browser()
-            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
-                self.persist_account_status("Không vào được Facebook")
-                return "Không vào được Facebook"
-
-            if not self.sleep_with_stop(2):
-                return "Đã dừng"
-
-            logged_in = self.is_logged_in()
-            self.cookie_raw = self.get_cookie_raw() if self.context else getattr(self.task, "cookie", "")
-        finally:
-            self.close()
+    def run_check_uid_status(self) -> str:
+        self.log_row("Đang kiểm tra UID Facebook")
+        uid = resolve_facebook_uid(
+            account_name=getattr(self.task, "account_name", ""),
+            path_chrome=getattr(self.task, "path_chrome", ""),
+            email=getattr(self.task, "email", ""),
+            cookie=getattr(self.task, "cookie", ""),
+        )
+        if not uid:
+            status = "Không có UID Facebook"
+            self.persist_account_status(status)
+            self.log_row(status)
+            return status
 
         if self._stop_requested:
             return "Đã dừng"
 
-        if not logged_in:
-            self.persist_account_status("Đã đăng xuất")
-            return "Đã đăng xuất"
-
-        page_names = self.fetch_page_names_from_graph(getattr(self.task, "token", ""), self.cookie_raw)
-        if not page_names:
-            page_names = self.fetch_page_names_from_html()
-
-        if page_names is None:
-            self.persist_account_status("Đã đăng nhập")
-            self.log_row("Đã đăng nhập, nhưng chưa lấy được danh sách page")
-        else:
-            self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
-            self.log_row(f"Đã cập nhật {len(page_names)} page")
-
-        return "Đã đăng nhập"
-
-    def run_refresh_page_names(self) -> str:
-        self.log_row("Đang cập nhật tên page")
-        logged_in = False
-
-        try:
-            self._start_browser()
-            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
-                self.persist_account_status("Không vào được Facebook")
-                return "Không vào được Facebook"
-
-            if not self.sleep_with_stop(2):
-                return "Đã dừng"
-
-            logged_in = self.is_logged_in()
-            self.cookie_raw = self.get_cookie_raw() if self.context else getattr(self.task, "cookie", "")
-        finally:
-            self.close()
-
-        if self._stop_requested:
+        if not self.sleep_with_stop(random.uniform(0.1, 0.7)):
             return "Đã dừng"
 
-        if not logged_in:
-            self.persist_account_status("Đã đăng xuất")
-            return "Đã đăng xuất"
+        self.log_row(f"Đang kiểm tra UID: {uid}")
+        result = self._check_uid_status_with_retry(uid)
+        if not result:
+            status = "UID lỗi mạng"
+            self.persist_account_status(status)
+            self.log_row(f"{status}: {uid}")
+            return status
 
-        page_names = self.fetch_page_names_from_graph(getattr(self.task, "token", ""), self.cookie_raw)
-        if not page_names:
-            page_names = self.fetch_page_names_from_html()
+        status = "UID sống" if result.get("alive") else "UID chết"
+        self.persist_account_status(status)
+        self.log_row(f"{status}: {uid}")
+        return status
 
-        if page_names is None:
-            page_names = []
+    @staticmethod
+    def _short_error(error: Exception, limit: int = 120) -> str:
+        message = " ".join(str(error or "").split())
+        if len(message) <= limit:
+            return message
+        return message[: max(1, limit - 3)].rstrip() + "..."
 
-        self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
-        if page_names:
-            self.log_row(f"Đã cập nhật {len(page_names)} page")
-        else:
-            self.log_row("Đã cập nhật: profile hiện chưa có page")
+    def _check_uid_status_with_retry(self, uid: str) -> dict | None:
+        proxy_value = getattr(self.task, "proxy", "")
+        proxy_attempted = False
+        last_error = None
 
-        return "Đã cập nhật tên page"
+        try:
+            proxies = build_requests_proxies(proxy_value)
+        except Exception as exc:
+            proxies = None
+            last_error = exc
+            self.log_row(f"Proxy kiểm tra UID không hợp lệ, bỏ qua proxy: {self._short_error(exc)}")
+
+        for attempt in range(1, 3):
+            if self._stop_requested:
+                return None
+
+            try:
+                if proxies:
+                    proxy_attempted = True
+                    return check_facebook_uid_status(uid, proxies=proxies, timeout=15)
+                return check_facebook_uid_status(uid, proxies=None, timeout=15)
+            except FacebookUidCheckNetworkError as exc:
+                last_error = exc
+                self.log_row(f"Lỗi mạng khi kiểm tra UID lần {attempt}/2: {self._short_error(exc)}")
+                if not self.sleep_with_stop(0.8 * attempt):
+                    return None
+            except Exception as exc:
+                last_error = exc
+                self.log_row(f"Không kiểm tra được UID: {self._short_error(exc)}")
+                return None
+
+        if proxy_attempted and not self._stop_requested:
+            try:
+                self.log_row("Proxy lỗi, thử kiểm tra UID không dùng proxy")
+                return check_facebook_uid_status(uid, proxies=None, timeout=15)
+            except Exception as exc:
+                last_error = exc
+                self.log_row(f"Không kiểm tra được UID sau fallback: {self._short_error(exc)}")
+
+        if last_error:
+            logger.warning("[Row %s] UID check failed for uid=%s: %s", self.row, uid, last_error)
+        return None
 
     def run_refresh_login_data(self) -> str:
         self.log_row("Đang cập nhật cookie/token và số page")
@@ -1399,16 +1601,41 @@ class Worker_Handle(QThread):
         else:
             self.log_row("Chưa lấy được cookie/token, chuyển sang đọc tên page bằng HTML")
 
-        if not page_names:
+        if page_names is None:
             page_names = self.fetch_page_names_from_html()
 
         if page_names is None:
-            AccountDB(None).update_status_by_path(self.task.path_chrome, "Đã đăng nhập")
-            self.log_row("Đã lưu trạng thái đăng nhập, nhưng chưa lấy được danh sách page")
+            page_names = []
+            self.persist_account_status("Đã đăng nhập", 0, page_names)
+            self.log_row("Không lấy được danh sách page, đã cập nhật page = 0")
         else:
             self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
             self.log_row(f"Đã cập nhật {len(page_names)} page")
 
+        return "Đã đăng nhập"
+
+    def run_refresh_page_data(self) -> str:
+        self.log_row("Đang cập nhật page mới qua Graph API")
+
+        page_names = self.fetch_page_names_from_graph_with_fallback(
+            getattr(self.task, "token", ""),
+            getattr(self.task, "cookie", ""),
+        )
+        if page_names is None:
+            db = AccountDB(None)
+            old_account = db.find_account_by_exact_path(self.task.path_chrome) or {}
+            old_page_count = int(old_account.get("Page_Count") or 0)
+            old_page_names = old_account.get("Page_Names") or ""
+            self.log_page_count(old_page_count)
+            self.log_page_names(self._dedupe_page_names(old_page_names.splitlines()))
+            self.log_row("Khong cap nhat duoc page moi, khong ghi de ve 0")
+            return "Khong cap nhat duoc page"
+
+        self.persist_account_status("Đã đăng nhập", len(page_names), page_names)
+        if page_names:
+            self.log_row(f"Đã cập nhật {len(page_names)} page: {', '.join(page_names[:5])}")
+        else:
+            self.log_row("Đã cập nhật page: tài khoản hiện có 0 page")
         return "Đã đăng nhập"
 
     # =========================
@@ -1430,6 +1657,7 @@ class Worker_Handle(QThread):
             account_token=self.eaag_token,
             account_cookies=self.cookie_raw,
             account_name=self.task.account_name,
+            proxies=build_requests_proxies(getattr(self.task, "proxy", "")),
             token_tele=self.task.token_tele,
             idchat=self.task.id_chat,
             prompt=self.task.prompt,
@@ -1460,21 +1688,21 @@ class Worker_Handle(QThread):
     # Main thread flow
     # =========================
     def run(self):
-        if self.action_mode not in ("crawl", "check_login", "refresh_login_data", "refresh_page_names"):
+        if self.action_mode not in ("crawl", "check_uid_status", "refresh_login_data", "refresh_page_data"):
             final_status = "Chức năng này không còn được hỗ trợ"
             self.log_row(final_status)
             self.finished_signal.emit(self.row, final_status)
             return
 
-        if self.action_mode in ("check_login", "refresh_login_data", "refresh_page_names"):
+        if self.action_mode in ("check_uid_status", "refresh_login_data", "refresh_page_data"):
             final_status = "Đã dừng"
             try:
-                if self.action_mode == "check_login":
-                    final_status = self.run_check_login()
+                if self.action_mode == "check_uid_status":
+                    final_status = self.run_check_uid_status()
                 elif self.action_mode == "refresh_login_data":
                     final_status = self.run_refresh_login_data()
-                else:
-                    final_status = self.run_refresh_page_names()
+                elif self.action_mode == "refresh_page_data":
+                    final_status = self.run_refresh_page_data()
             except Exception as e:
                 logger.exception(f"[Row {self.row}] Lỗi cập nhật đăng nhập: {e}")
                 final_status = f"Lỗi: {e}"
@@ -1494,16 +1722,20 @@ class Worker_Handle(QThread):
                 self.log_row(f"Bắt đầu chu kỳ {cycle_index}")
 
                 # =========================
-                # LOGIN
+                # LOGIN / CHECK ACCOUNT (LUỒNG 2)
+                # Check account bằng cookie+token -> hợp lệ chạy luôn;
+                # không hợp lệ thì refresh token rồi recheck Graph.
                 # =========================
-                self.cookie_raw, self.eaag_token = self.handle_login()
+                self.cookie_raw, self.eaag_token = self.prepare_worker_account()
 
                 if self._stop_requested:
                     final_status = "Đã dừng"
                     break
 
                 if not self.cookie_raw or not self.eaag_token:
-                    final_status = "Không lấy được cookie/token"
+                    # Sau N lần refresh vẫn không lấy được token hợp lệ.
+                    final_status = "Có thể nick bị đăng xuất"
+                    self.log_row(final_status)
                     break
 
                 self.log_row(f"Chu kỳ {cycle_index}: bắt đầu scan {total_groups} group")
@@ -1512,7 +1744,7 @@ class Worker_Handle(QThread):
                 # SCAN 1 CHU KỲ
                 # =========================
                 ok = self.process_posts_once()
-                print("SCAN RESULT:", ok)
+                logger.info("[Row %s] Scan result: %s", self.row, ok)
 
                 if self._stop_requested:
                     final_status = "Đã dừng"
