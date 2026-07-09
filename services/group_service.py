@@ -3,7 +3,11 @@ import time
 from datetime import datetime
 from logging import getLogger
 
-from integrations.facebook_client import FacebookClient, comment_post_as_random_page
+from integrations.facebook_client import (
+    FacebookClient,
+    comment_post_as_random_page,
+    get_managed_pages_with_tokens,
+)
 from integrations.openai_client import generate_comment_with_openai
 from services.post_service import (
     build_posts_status,
@@ -50,15 +54,16 @@ class GroupService:
         self.account_cookies = account_cookies
         self.account_name = account_name
         self.proxies = proxies
+        self._managed_pages_cache = None
         self.prompt = prompt
         self.prompt_cmt = prompt_cmt
         self.prompt_cmt_mode = prompt_cmt_mode
         self.API_KEY = API_KEY
         self.max_length_text = max_length_text
-        self.progress_callback = progress_callback
-        self.status_callback = status_callback
-        self.post_callback = post_callback
-        self.stop_callback = stop_callback
+        self.progress_callback = progress_callback or (lambda _value: None)
+        self.status_callback = status_callback or (lambda _message: None)
+        self.post_callback = post_callback or (lambda _value: None)
+        self.stop_callback = stop_callback or (lambda: False)
         logger.debug(
             "Initialized GroupService: groups=%s delay_seconds=%s recent_window_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
             len(groups_list or []),
@@ -106,6 +111,22 @@ class GroupService:
 
         return str(self.prompt_cmt or "").strip(), "text"
 
+    def _get_cached_managed_pages(self) -> list[dict]:
+        if self._managed_pages_cache is not None:
+            return self._managed_pages_cache
+
+        self._managed_pages_cache = get_managed_pages_with_tokens(
+            account_token=self.account_token,
+            account_cookies=self.account_cookies,
+            account_name=self.account_name,
+            proxies=self.proxies,
+        )
+        logger.info(
+            "Cached managed page tokens for current run: pages=%s",
+            len(self._managed_pages_cache),
+        )
+        return self._managed_pages_cache
+
     def _comment_valid_posts(self, posts_status: list[dict]) -> list[dict]:
         if not posts_status:
             return posts_status
@@ -141,6 +162,16 @@ class GroupService:
 
         self.status_callback(f"Bắt đầu comment {len(valid_posts)} bài viết phù hợp")
 
+        try:
+            managed_pages = self._get_cached_managed_pages()
+        except Exception as e:
+            logger.warning("Failed to cache managed page tokens before commenting: %s", e)
+            self.status_callback(f"Khong lay duoc token page de comment: {e}")
+            for post in valid_posts:
+                post["comment_status"] = 0
+                post["comment_error"] = str(e)
+            return posts_status
+
         for index, post in enumerate(valid_posts, start=1):
             if self.stop_callback and self.stop_callback():
                 return posts_status
@@ -155,6 +186,7 @@ class GroupService:
                     account_cookies=self.account_cookies,
                     account_name=self.account_name,
                     proxies=self.proxies,
+                    managed_pages=managed_pages,
                 )
                 post["comment_status"] = 1
                 post["comment_id"] = result.get("comment_id")
@@ -169,13 +201,18 @@ class GroupService:
                     result.get("page_name"),
                 )
                 self.status_callback(
-                    "Đã comment %s/%s bài hợp lệ bằng page %s"
-                    % (index, len(valid_posts), result.get("page_name") or "")
+                    "Đã comment %s/%s bài hợp lệ bằng page %s (comment_id: %s)"
+                    % (
+                        index,
+                        len(valid_posts),
+                        result.get("page_name") or "",
+                        result.get("comment_id") or "?",
+                    )
                 )
             except Exception as e:
                 post["comment_status"] = 0
                 post["comment_error"] = str(e)
-                logger.exception("Failed to comment valid post_id=%s: %s", post_id, e)
+                logger.warning("Failed to comment valid post_id=%s: %s", post_id, e)
                 self.status_callback("Comment thất bại bài %s/%s" % (index, len(valid_posts)))
 
             if not self.sleep_with_stop(1):
