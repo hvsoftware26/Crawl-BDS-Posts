@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import re
 import struct
 import time
 from urllib.parse import parse_qs, urlparse
 
 
+logger = logging.getLogger(__name__)
 DEFAULT_PERIOD_SECONDS = 30
 DEFAULT_DIGITS = 6
 DEFAULT_MIN_SECONDS_REMAINING = 8
@@ -74,5 +76,5 @@ def Get_Towfa(
 
         return generate_totp(twofa, period=period)
     except Exception as e:
-        print(f"Loi lay 2FA: {e}")
+        logger.warning("Could not generate 2FA code: %s", e)
         return False
