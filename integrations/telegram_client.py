@@ -3,6 +3,8 @@ import logging
 
 import requests
 
+from utils.security import mask_secret
+
 logger = logging.getLogger(__name__)
 
 
@@ -13,6 +15,14 @@ def _build_chat_id(idchat):
     if normalized_idchat.startswith("-"):
         return normalized_idchat
     return f"-{normalized_idchat}"
+
+
+def _sanitize_error(error, token_tele):
+    error_text = str(error)
+    token_value = str(token_tele or "")
+    if token_value:
+        error_text = error_text.replace(token_value, mask_secret(token_value))
+    return error_text
 
 
 def send_message(message, token_tele, idchat):
@@ -29,20 +39,29 @@ def send_message(message, token_tele, idchat):
             "message": "Telegram config is missing.",
         }
 
-    post = requests.get(
-        f"https://api.telegram.org/bot{token_tele}/sendMessage",
-        params={
-            "chat_id": _build_chat_id(idchat),
-            "text": message,
-        },
-        timeout=30,
-    )
-    return {
-        "status": "success" if post.json().get("ok") else "error",
-        "message": "Message sent successfully."
-        if post.json().get("ok")
-        else "Failed to send message.",
-    }
+    try:
+        post = requests.get(
+            f"https://api.telegram.org/bot{token_tele}/sendMessage",
+            params={
+                "chat_id": _build_chat_id(idchat),
+                "text": message,
+            },
+            timeout=30,
+        )
+        result = post.json()
+        return {
+            "status": "success" if result.get("ok") else "error",
+            "message": "Message sent successfully."
+            if result.get("ok")
+            else result.get("description", "Failed to send message."),
+        }
+    except Exception as e:
+        safe_error = _sanitize_error(e, token_tele)
+        logger.error("Failed to send message with Telegram token=%s: %s", mask_secret(token_tele), safe_error)
+        return {
+            "status": "error",
+            "message": safe_error,
+        }
 
 
 def send_document(file_path, token_tele, idchat, caption=None, parse_mode="HTML"):
@@ -87,9 +106,9 @@ def send_document(file_path, token_tele, idchat, caption=None, parse_mode="HTML"
         }
 
     except Exception as e:
-        logger.exception("Failed to send document: %s", e)
+        safe_error = _sanitize_error(e, token_tele)
+        logger.error("Failed to send document with Telegram token=%s: %s", mask_secret(token_tele), safe_error)
         return {
             "status": "error",
-            "message": str(e),
+            "message": safe_error,
         }
-
