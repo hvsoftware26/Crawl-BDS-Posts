@@ -46,10 +46,10 @@ class ScanGroups:
         self.token_tele = token_tele
         self.idchat = idchat
         self.max_length_text = max_length_text
-        self.progress_callback = progress_callback
-        self.status_callback = status_callback
-        self.post_callback = post_callback
-        self.stop_callback = stop_callback
+        self.progress_callback = progress_callback or (lambda _value: None)
+        self.status_callback = status_callback or (lambda _message: None)
+        self.post_callback = post_callback or (lambda _value: None)
+        self.stop_callback = stop_callback or (lambda: False)
         self.total_posts_scanned = 0
 
         logger.debug(
