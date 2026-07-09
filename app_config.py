@@ -1,27 +1,28 @@
-# Global configuration
+﻿# Global configuration
 import re
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-#setting for Chromium Path
-import winreg
+try:
+    import winreg
+except ImportError:
+    winreg = None
+
 
 def get_chrome_path_from_registry():
+    if winreg is None:
+        return None
+
     reg_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
     ]
 
     for reg_path in reg_paths:
         try:
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                reg_path
-            )
-
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path)
             value, _ = winreg.QueryValueEx(key, "")
             return value
-
         except FileNotFoundError:
             continue
 
@@ -49,7 +50,7 @@ def sanitize_profile_name(value: str) -> str:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", normalized).strip("._-")
 
     if not safe_name:
-        raise ValueError("TÃªn profile khÃ´ng há»£p lá»‡")
+        raise ValueError("Tên profile không hợp lệ")
 
     return safe_name
 
@@ -61,7 +62,7 @@ def build_local_profile_path(profile_name: str) -> Path:
 def build_profile_path_from_email(email: str) -> str:
     email_value = str(email or "").strip()
     if not email_value or "@" not in email_value:
-        raise ValueError("Email khÃ´ng há»£p lá»‡")
+        raise ValueError("Email không hợp lệ")
 
     profile_name = email_value.split("@", 1)[0]
     return str(build_local_profile_path(profile_name))
