@@ -268,16 +268,19 @@ class MultiProfileDialog(QDialog):
 
         mode_row = QHBoxLayout()
         mode_row.setSpacing(12)
-        mode_row.addWidget(LabelBox("Định dạng dữ liệu"))
+        mode_row.addWidget(LabelBox("Định dạng import"))
 
-        self.radio_proxy = QRadioButton("Profile Chrome - Proxy")
+        self.radio_proxy = QRadioButton("Cookie/Token")
         self.radio_normal = QRadioButton("Profile Chrome")
         self.radio_proxy.setChecked(True)
+        self.radio_proxy.hide()
+        self.radio_normal.hide()
 
         group = QButtonGroup(self)
         group.addButton(self.radio_proxy)
         group.addButton(self.radio_normal)
 
+        mode_row.addWidget(LabelBox("Cookie/Token, proxy tùy chọn"))
         mode_row.addWidget(self.radio_proxy)
         mode_row.addWidget(self.radio_normal)
         mode_row.addStretch()
@@ -291,10 +294,9 @@ class MultiProfileDialog(QDialog):
         self.editor = QPlainTextEdit()
         self.editor.setPlaceholderText(
             "Dán danh sách tài khoản tại đây...\n"
-            "Dùng proxy chọn chế độ Profile Chrome-Proxy:\n"
-            "Tên tài khoản|proxy|email|password|2FA\n"
-            "Không dùng proxy chọn chế độ Profile Chrome:\n"
-            "Tên tài khoản|email|password|2FA"
+            "Định dạng:\n"
+            "uid|password|cookie|token|mail|pass_mail\n"
+            "uid|password|cookie|token|mail|pass_mail|proxy"
         )
         self.editor.setMinimumHeight(180)
         top_layout.addWidget(self.editor)
@@ -316,18 +318,14 @@ class MultiProfileDialog(QDialog):
         self.update_help_text()
 
     def update_help_text(self):
-        if self.radio_proxy.isChecked():
-            text = (
-                "Dán nhiều dòng tài khoản vào đây. Mỗi dòng là 1 tài khoản.\n"
-                "Ví dụ:\n"
-                "Tên tài khoản|127.0.0.1:8000:user:pass|example@gmail.com|Nohope1111@@|2FA"
-            )
-        else:
-            text = (
-                "Dán nhiều dòng tài khoản vào đây. Mỗi dòng là 1 tài khoản.\n"
-                "Ví dụ:\n"
-                "Tên tài khoản|example@gmail.com|Nohope1111@@|2FA"
-            )
+        text = (
+            "Dán nhiều dòng tài khoản vào đây. Mỗi dòng là 1 tài khoản.\n"
+            "Sau khi import, tool sẽ nạp cookie vào profile Chrome và dùng token/cookie để cập nhật tên nick, số page.\n"
+            "Có thể bỏ proxy hoặc thêm proxy ở cuối dòng.\n"
+            "Ví dụ:\n"
+            "61585766361850|password|xs=abc;datr=abc;fr=abc;c_user=61585766361850|EAAB...|mail@example.com|pass_mail\n"
+            "61585766361850|password|xs=abc;datr=abc;fr=abc;c_user=61585766361850|EAAB...|mail@example.com|pass_mail|36.50.175.55:15088:user:pass"
+        )
         self.help_box.setText(text)
 
 
@@ -358,7 +356,7 @@ class Ui_MainWindow(object):
 
         self.api_label = LabelBox("API key ChatGPT")
         self.api_edit = PlaceholderPathEdit("Nhập API key ChatGPT...")
-        self.btn_check_api = QPushButton("Check key")
+        self.btn_check_api = QPushButton("Kiểm tra key")
 
         self.group_label = LabelBox("Danh sách group")
         self.group_path = PlaceholderPathEdit("Chưa chọn file danh sách group...")
@@ -521,14 +519,14 @@ class Ui_MainWindow(object):
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.Stretch)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
         header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.Stretch)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         self.left_layout.addWidget(self.table)
 
         self.bottom_buttons = QHBoxLayout()
-        self.btn_delete_row = QPushButton("Xóa dòng")
+        self.btn_delete_row = QPushButton("Xóa tài khoản")
         self.btn_select_all = QPushButton("Chọn tất cả")
         self.btn_clear_log = QPushButton("Xóa log")
         self.bottom_buttons.addWidget(self.btn_delete_row)
@@ -551,6 +549,7 @@ class Ui_MainWindow(object):
         self.outer.addLayout(self.body_layout, 1)
 
         self.table.setColumnWidth(0, 42)
+        self.table.setColumnWidth(4, 240)
         self.table.setColumnWidth(7, 140)
 
 
