@@ -1,4 +1,4 @@
-# Facebook BDS Lead Finder
+﻿# Facebook BDS Lead Finder
 
 - Tool desktop dùng để quản lý nhiều profile Facebook, quét bài viết trong danh sách group, lọc bài theo keyword và prompt AI, sau đó xuất kết quả ra file Excel và gửi về Telegram.
 - Tool phục vụ **nhu cầu tìm kiếm khách hàng tiềm năng có nhu cầu cho đa lĩnh vực Sales, Bất động sản,....**
@@ -9,6 +9,7 @@
 - Thêm và quản lý nhiều profile Facebook.
 - Hỗ trợ profile có proxy hoặc không có proxy.
 - Tự động mở Chrome theo từng profile để đăng nhập, lấy cookie và token cần thiết.
+- Profile có proxy sẽ load Proxy Helper extension từ `resources/extensions/proxy_helper`, cấu hình proxy tự động và kiểm tra IP qua `https://httpbin.org/ip` trước khi mở Facebook thủ công.
 - Quét danh sách group Facebook theo chu kỳ đã cấu hình.
 - Lọc bài viết theo keyword.
 - Lọc tiếp bằng OpenAI theo prompt tùy chỉnh.
@@ -41,11 +42,7 @@ Cài các thư viện cần thiết:
 pip install -r requirements.txt
 ```
 
-Nếu môi trường Playwright yêu cầu cài driver bổ sung, chạy thêm:
-
-```powershell
-python -m playwright install
-```
+Tool sử dụng Google Chrome cài s?n trên máy qua Playwright, không cần cài browser Chromium riêng.
 
 ## Chạy tool
 
@@ -187,7 +184,7 @@ Mỗi dòng bài viết trong Excel gồm link bài, thời gian tạo và nội
 
 Trong bảng profile, có thể tích chọn một hoặc nhiều dòng, sau đó bấm chuột phải để:
 
-- Copy đường dẫn Chrome profile.
+- Copy đường dẫn profile.
 - Copy proxy.
 - Copy email, password và 2FA.
 - Copy token.
@@ -221,13 +218,14 @@ services/           Xử lý nghiệp vụ
 utils/              Hàm tiện ích
 workers/            Worker chạy tiến trình quét
 main.py             Điểm chạy chính của tool
-app_config.py       Cấu hình Chrome, profile và API helper
+app_config.py       Cấu hình profile và API helper
 ```
 
 ## Lưu ý bảo mật và vận hành
 
 - Không chia sẻ `tele.json`, OpenAI API key, cookie, token Facebook hoặc file database.
 - Không commit `database/accounts.db`, `Profile-Chrome`, `main.log` và file export có dữ liệu thật.
+- Khi build file exe, giữ kèm thư mục `resources/extensions/proxy_helper` để cấu hình proxy bằng extension hoạt động.
 - Sử dụng tài khoản, group và dữ liệu theo đúng quyền truy cập và điều khoản của nền tảng liên quan.
 - Nếu Facebook yêu cầu checkpoint, hãy mở profile bằng menu chuột phải, xử lý thủ công rồi chạy lại.
 - Nếu tool báo profile đang được sử dụng, đóng cửa sổ Chrome của profile đó trước khi bấm `Start`.
