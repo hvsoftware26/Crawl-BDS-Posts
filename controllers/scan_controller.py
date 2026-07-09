@@ -1,5 +1,6 @@
 # Scan controller
 import json
+import threading
 from logging import getLogger
 from pathlib import Path
 
@@ -8,6 +9,74 @@ from workers.scan_groups_worker import ScanGroups
 
 logger = getLogger(__name__)
 POSTS_JSON_PATH = Path(__file__).resolve().parents[1] / "data" / "posts.json"
+POSTS_JSON_LOCK = threading.Lock()
+
+
+def _post_key(post: dict) -> tuple[str, str]:
+    return (
+        str((post or {}).get("group_id") or ""),
+        str((post or {}).get("id") or ""),
+    )
+
+
+def _merge_posts_status(existing_posts: list[dict], incoming_posts: list[dict]) -> list[dict]:
+    merged_posts = []
+    index_by_key = {}
+
+    for post in existing_posts or []:
+        if not isinstance(post, dict):
+            continue
+
+        key = _post_key(post)
+        if not key[1]:
+            continue
+
+        index_by_key[key] = len(merged_posts)
+        merged_posts.append(post)
+
+    for post in incoming_posts or []:
+        if not isinstance(post, dict):
+            continue
+
+        key = _post_key(post)
+        if not key[1]:
+            continue
+
+        existing_index = index_by_key.get(key)
+        if existing_index is None:
+            index_by_key[key] = len(merged_posts)
+            merged_posts.append(post)
+        else:
+            merged_posts[existing_index] = post
+
+    return merged_posts
+
+
+def _read_posts_json() -> list[dict]:
+    if not POSTS_JSON_PATH.exists():
+        return []
+
+    try:
+        with open(POSTS_JSON_PATH, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read posts JSON for merge: path=%s error=%s", POSTS_JSON_PATH, exc)
+        return []
+
+    return payload if isinstance(payload, list) else []
+
+
+def _atomic_write_posts_json(posts_status: list[dict]):
+    POSTS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = POSTS_JSON_PATH.with_name(f"{POSTS_JSON_PATH.name}.tmp")
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(posts_status, file, ensure_ascii=False, indent=4)
+    temp_path.replace(POSTS_JSON_PATH)
+
+
+def reset_posts_json():
+    with POSTS_JSON_LOCK:
+        _atomic_write_posts_json([])
 
 
 class ScanController:
@@ -66,17 +135,21 @@ class ScanController:
         )
 
     def _write_posts_json(self, posts_status: list[dict]):
-        POSTS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-        logger.info(
-            "Writing posts JSON: path=%s posts_count=%s valid_posts=%s invalid_posts=%s",
-            POSTS_JSON_PATH,
-            len(posts_status or []),
-            sum(1 for post in (posts_status or []) if post.get("status") == 1),
-            sum(1 for post in (posts_status or []) if post.get("status") == 0),
-        )
-        with open(POSTS_JSON_PATH, "w", encoding="utf-8") as file:
-            json.dump(posts_status, file, ensure_ascii=False, indent=4)
-        logger.info("Finished writing posts JSON to %s", POSTS_JSON_PATH)
+        incoming_posts = posts_status or []
+        with POSTS_JSON_LOCK:
+            existing_posts = _read_posts_json()
+            merged_posts = _merge_posts_status(existing_posts, incoming_posts)
+            logger.info(
+                "Writing merged posts JSON: path=%s existing=%s incoming=%s merged=%s valid_posts=%s invalid_posts=%s",
+                POSTS_JSON_PATH,
+                len(existing_posts),
+                len(incoming_posts),
+                len(merged_posts),
+                sum(1 for post in merged_posts if post.get("status") == 1),
+                sum(1 for post in merged_posts if post.get("status") == 0),
+            )
+            _atomic_write_posts_json(merged_posts)
+        logger.info("Finished writing merged posts JSON to %s", POSTS_JSON_PATH)
 
     def start_scan(self):
         logger.info(
