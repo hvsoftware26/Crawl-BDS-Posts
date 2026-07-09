@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 class OpenAIService:
     BASE_URL = "https://api.openai.com/v1"
 
-    def __init__(self, api_key: str, model: str = "gpt-5.4-nano", timeout: int = 30):
+    def __init__(self, api_key: str, model: str = "gpt-5-mini", timeout: int = 30):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
@@ -42,10 +42,10 @@ class OpenAIService:
                 }
 
             elif res.status_code == 401:
-                return {"ok": False, "message": "API key sai hoặc đã bị revoke"}
+                return {"ok": False, "message": "API key không hợp lệ hoặc đã bị thu hồi"}
 
             elif res.status_code == 403:
-                return {"ok": False, "message": "Bị từ chối truy cập (quyền/khu vực)"}
+                return {"ok": False, "message": "Không có quyền truy cập"}
 
             else:
                 return {"ok": False, "message": f"{res.status_code}: {res.text}"}
@@ -78,12 +78,12 @@ class OpenAIService:
     def check_model(self) -> Dict:
         result = self.list_models()
         if not result.get("ok"):
-            return {"ok": False, "message": result.get("message", "Không lấy được danh sách model")}
+            return {"ok": False, "message": result.get("message", "Không tải được danh sách model")}
 
         models = result.get("models", [])
         if self.model in models:
             return {"ok": True, "message": f"Model {self.model} dùng được"}
-        return {"ok": False, "message": f"Model {self.model} không tồn tại hoặc chưa được cấp quyền"}
+        return {"ok": False, "message": f"Model {self.model} không dùng được hoặc chưa được cấp quyền"}
 
     def ask(self, prompt: str) -> Dict:
         try:
@@ -121,13 +121,13 @@ class OpenAIService:
                 }
 
             elif res.status_code == 401:
-                return {"ok": False, "message": "API key sai hoặc đã bị revoke"}
+                return {"ok": False, "message": "API key không hợp lệ hoặc đã bị thu hồi"}
 
             elif res.status_code == 403:
                 return {"ok": False, "message": "Không có quyền dùng model hoặc endpoint này"}
 
             elif res.status_code == 429:
-                return {"ok": False, "message": "Hết quota / chưa bật billing / bị rate limit"}
+                return {"ok": False, "message": "Hết quota, billing bị tắt hoặc bị giới hạn tốc độ"}
 
             else:
                 return {"ok": False, "message": f"{res.status_code}: {res.text}"}
