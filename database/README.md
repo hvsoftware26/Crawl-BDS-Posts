@@ -29,6 +29,8 @@
 | 8   | `Token`        | TEXT        | Mặc định "" |
 | 9   | `Status`       | TEXT        | Mặc định "Chưa rõ" |
 | 10  | `Post_Count`   | INTEGER     | Mặc định 0 |
+| 11  | `Page_Count`   | INTEGER     | Tổng số page Facebook account quản lý, mặc định 0 |
+| 12  | `Page_Names`   | TEXT        | Danh sách tên page, mỗi dòng một page |
 
 ---
 
@@ -46,7 +48,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     Cookie TEXT DEFAULT "",
     Token TEXT DEFAULT "",
     Status TEXT DEFAULT "Chưa rõ",
-    Post_Count INTEGER DEFAULT 0
+    Post_Count INTEGER DEFAULT 0,
+    Page_Count INTEGER DEFAULT 0,
+    Page_Names TEXT DEFAULT ''
 );
 ```
 
@@ -58,6 +62,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 - Token: ""
 - Status: "Chưa rõ"
 - Post_Count: 0
+- Page_Count: 0
+- Page_Names: ""
 
 ---
 
@@ -67,7 +73,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 2. Chạy script login
 3. Lấy Cookie / Token
 4. Cập nhật Status
-5. Tăng Post_Count
+5. Cập nhật Page_Count và Page_Names sau khi đăng nhập thủ công hoặc kiểm tra đăng nhập
+6. Tăng Post_Count
 
 ---
 

@@ -113,7 +113,7 @@ def build_group_posts_excel(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
-    # ✅ FIX CHÍNH Ở ĐÂY
+    # Main row parser.
     group_name = extract_group_name(group_id)
     group_name = safe_filename(group_name)
 

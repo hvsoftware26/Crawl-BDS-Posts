@@ -1,43 +1,10 @@
 import sqlite3
+import logging
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from app_config import APP_BASE_DIR, PROFILE_ROOT_DIR
 
-STATUS_TEXT_MAP = {
-    "Chua ro": "Chưa rõ",
-    "Dang cho luong": "Đang chờ luồng",
-    "Dang khoi dong": "Đang khởi động",
-    "Dang kiem tra dang nhap": "Đang kiểm tra đăng nhập",
-    "Da dung": "Đã dừng",
-    "Da dang nhap": "Đã đăng nhập",
-    "Da dang xuat": "Đã đăng xuất",
-    "Khong vao duoc Facebook": "Không vào được Facebook",
-    "Khong lay duoc cookie/token": "Không lấy được cookie/token",
-    "Xu ly bai viet that bai": "Xử lý bài viết thất bại",
-}
-
-PROXY_TEXT_MAP = {
-    "Khong": "Không",
-}
-
-
-def format_status_text(status: str) -> str:
-    status_value = str(status or "").strip()
-    status_key = status_value.casefold()
-    for source_text, formatted_text in STATUS_TEXT_MAP.items():
-        if source_text.casefold() == status_key:
-            return formatted_text
-    return status_value
-
-
-def format_proxy_text(proxy: str) -> str:
-    proxy_value = str(proxy or "").strip()
-    proxy_key = proxy_value.casefold()
-    for source_text, formatted_text in PROXY_TEXT_MAP.items():
-        if source_text.casefold() == proxy_key:
-            return formatted_text
-    return proxy_value
-
+logger = logging.getLogger(__name__)
 
 class AccountDB:
     def __init__(self, db_name: None):
@@ -48,7 +15,7 @@ class AccountDB:
             db_path = Path(db_name)
             base_dir = db_path.resolve().parent.parent
 
-        # ✅ Tạo folder nếu chưa tồn tại
+        # Ensure the database folder exists.
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.base_dir = base_dir.resolve()
@@ -56,7 +23,10 @@ class AccountDB:
         self.db_name = str(db_path)
 
     def _connect(self):
-        return sqlite3.connect(self.db_name)
+        conn = sqlite3.connect(self.db_name, timeout=30)
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        return conn
 
     def _normalize_profile_path_value(self, path_chrome: str) -> str:
         normalized_input = str(path_chrome or "").strip().strip('"')
@@ -104,18 +74,6 @@ class AccountDB:
             self._rewrite_profile_path(original_path, normalized_path)
             row_dict["Path_Chrome"] = normalized_path
 
-        original_proxy = row_dict.get("Proxy") or ""
-        normalized_proxy = format_proxy_text(original_proxy)
-        if normalized_proxy != original_proxy:
-            self._rewrite_text_field(row_dict["id"], "Proxy", normalized_proxy)
-            row_dict["Proxy"] = normalized_proxy
-
-        original_status = row_dict.get("Status") or ""
-        normalized_status = format_status_text(original_status)
-        if normalized_status != original_status:
-            self._rewrite_text_field(row_dict["id"], "Status", normalized_status)
-            row_dict["Status"] = normalized_status
-
         return row_dict
 
     def _create_table(self):
@@ -128,6 +86,7 @@ class AccountDB:
             Email TEXT,
             Password TEXT,
             Twofa TEXT,
+            Mail_Password TEXT DEFAULT '',
             Cookie TEXT,
             Token TEXT,
             Status TEXT,
@@ -140,6 +99,7 @@ class AccountDB:
             conn.execute(query)
             self._ensure_column(conn, "accounts", "Page_Count", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "accounts", "Page_Names", "TEXT DEFAULT ''")
+            self._ensure_column(conn, "accounts", "Mail_Password", "TEXT DEFAULT ''")
             conn.commit()
 
     def _ensure_column(self, conn, table_name: str, column_name: str, column_definition: str):
@@ -162,6 +122,7 @@ class AccountDB:
         token: str,
         status: str,
         post_count: int,
+        mail_password: str = "",
     ):
         query = """
         INSERT INTO accounts (
@@ -171,12 +132,13 @@ class AccountDB:
             Email,
             Password,
             Twofa,
+            Mail_Password,
             Cookie,
             Token,
             Status,
             Post_Count
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         normalized_path = self._normalize_profile_path_value(path_chrome)
         with self._connect() as conn:
@@ -185,13 +147,14 @@ class AccountDB:
                 (
                     account_name,
                     normalized_path,
-                    format_proxy_text(proxy),
+                    proxy,
                     email,
                     password,
                     twofa,
+                    mail_password,
                     cookie,
                     token,
-                    format_status_text(status),
+                    status,
                     post_count,
                 ),
             )
@@ -239,7 +202,7 @@ class AccountDB:
                     (
                         account_name,
                         normalized_path,
-                        format_proxy_text(proxy),
+                        proxy,
                         email,
                         password,
                         twofa,
@@ -263,6 +226,72 @@ class AccountDB:
         )
         return "created"
 
+    def save_imported_cookie_account(
+        self,
+        uid: str,
+        password: str,
+        cookie: str,
+        token: str,
+        email: str,
+        mail_password: str,
+        path_chrome: str,
+        twofa: str = "",
+        proxy: str = "",
+    ) -> str:
+        normalized_path = self._normalize_profile_path_value(path_chrome)
+        existing_account = self.find_account_by_exact_path(normalized_path)
+
+        if existing_account:
+            query = """
+            UPDATE accounts
+            SET
+                Account_Name = ?,
+                Path_Chrome = ?,
+                Proxy = ?,
+                Email = ?,
+                Password = ?,
+                Twofa = ?,
+                Mail_Password = ?,
+                Cookie = ?,
+                Token = ?,
+                Status = ?
+            WHERE id = ?
+            """
+            with self._connect() as conn:
+                conn.execute(
+                    query,
+                    (
+                        uid,
+                        normalized_path,
+                        proxy,
+                        email,
+                        password,
+                        twofa,
+                        mail_password,
+                        cookie,
+                        token,
+                        "Đã nhập cookie",
+                        existing_account["id"],
+                    ),
+                )
+                conn.commit()
+            return "updated"
+
+        self.create_account(
+            account_name=uid,
+            path_chrome=normalized_path,
+            proxy=proxy,
+            email=email,
+            password=password,
+            twofa=twofa,
+            mail_password=mail_password,
+            cookie=cookie,
+            token=token,
+            status="Đã nhập cookie",
+            post_count=0,
+        )
+        return "created"
+
     def get_all_accounts(self) -> List[Dict[str, Any]]:
         query = "SELECT * FROM accounts"
         with self._connect() as conn:
@@ -280,7 +309,7 @@ class AccountDB:
         with self._connect() as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}%",)).fetchone()
-            print(row)
+            logger.debug("find_id_from_path_chrome matched=%s", bool(row))
             return row[0]
         
     def find_account_name_from_path_chrome(self, name_path: str) -> int:
@@ -298,6 +327,13 @@ class AccountDB:
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
             row_dict = self._normalize_account_row(row)
             return row_dict["Path_Chrome"]
+
+    def find_account_from_path_chrome(self, name_path: str) -> Optional[Dict[str, Any]]:
+        query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
+        with self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
+            return self._normalize_account_row(row)
         
     
     def find_info_account_from_path_chrome(self, name_path: str) -> str:
@@ -306,7 +342,8 @@ class AccountDB:
             conn.row_factory = sqlite3.Row
             row = conn.execute(query, (f"%\\{name_path}",)).fetchone()
             row_dict = self._normalize_account_row(row)
-            return row_dict["Email"]+"|"+row_dict["Password"]+"|"+row_dict["Twofa"]
+            third_value = row_dict.get("Mail_Password") or row_dict.get("Twofa") or ""
+            return row_dict["Email"]+"|"+row_dict["Password"]+"|"+third_value
         
     def find_proxy_from_path_chrome(self, name_path: str) -> str:
         query = "SELECT * FROM accounts WHERE Path_Chrome LIKE ?"
@@ -372,21 +409,48 @@ class AccountDB:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi update cookie/token: {e}")
+            logger.exception("Error updating cookie/token")
             return False
         
 
     def update_status_by_path(self, path_profile: str, status: str) -> bool:
         query = """ UPDATE accounts SET Status = ? WHERE Path_Chrome = ? """
         normalized_path = self._normalize_profile_path_value(path_profile)
-        normalized_status = format_status_text(status)
         try:
             with self._connect() as conn:
-                cursor = conn.execute(query, (normalized_status, normalized_path))
+                cursor = conn.execute(query, (status, normalized_path))
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi update status: {e}")
+            logger.exception("Error updating account status")
+            return False
+
+    def update_proxy_by_path(self, path_profile: str, proxy: str) -> bool:
+        query = """ UPDATE accounts SET Proxy = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(query, (proxy or "", normalized_path))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception:
+            logger.exception("Error updating account proxy")
+            return False
+
+    def update_account_name_by_path(self, path_profile: str, account_name: str) -> bool:
+        query = """ UPDATE accounts SET Account_Name = ? WHERE Path_Chrome = ? """
+        normalized_path = self._normalize_profile_path_value(path_profile)
+        normalized_name = str(account_name or "").strip()
+        if not normalized_path or not normalized_name:
+            return False
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(query, (normalized_name, normalized_path))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception:
+            logger.exception("Error updating account name")
             return False
 
     def mark_profile_logged_in(self, path_profile: str) -> bool:
@@ -420,7 +484,7 @@ class AccountDB:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi mark profile logged in: {e}")
+            logger.exception("Error marking profile logged in")
             return False
 
     def update_page_count_by_path(self, path_profile: str, page_count: int) -> bool:
@@ -432,7 +496,7 @@ class AccountDB:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi update page count: {e}")
+            logger.exception("Error updating page count")
             return False
 
     def update_page_names_by_path(self, path_profile: str, page_names: str) -> bool:
@@ -444,7 +508,7 @@ class AccountDB:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi update page names: {e}")
+            logger.exception("Error updating page names")
             return False
 
     def update_page_info_by_path(self, path_profile: str, page_count: int, page_names: str) -> bool:
@@ -459,7 +523,7 @@ class AccountDB:
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Lỗi update page info: {e}")
+            logger.exception("Error updating page info")
             return False
 
     def update_account(
@@ -491,10 +555,10 @@ class AccountDB:
                 (
                     account_name,
                     path_chrome,
-                    format_proxy_text(proxy),
+                    proxy,
                     email,
                     password,
-                    format_status_text(status),
+                    status,
                     post_count,
                     account_id,
                 ),

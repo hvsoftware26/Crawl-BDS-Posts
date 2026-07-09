@@ -1,203 +1,65 @@
-# Main GUI
-import sys, os, requests, json, shutil, subprocess, ctypes
-from ctypes import wintypes
+﻿# Main GUI
+import sys, os, json, re, shutil
+from logging import getLogger
 from pathlib import Path
 from typing import List
-from PyQt5.QtCore import Qt, QEvent, QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QTableWidgetItem, QMessageBox, QFileDialog,
-    QMenu, QHBoxLayout, QWidget, QCheckBox, QDialog, QLabel, QPushButton,
-    QVBoxLayout,
+    QMenu, QHBoxLayout, QVBoxLayout, QWidget, QCheckBox, QDialog,
+    QLabel, QLineEdit, QPushButton,
 )
-from services.sql_query_service import AccountDB, format_proxy_text, format_status_text
+from playwright.sync_api import sync_playwright
+from services.sql_query_service import AccountDB
+from controllers.scan_controller import reset_posts_json
 from resources.ui.gui import MultiProfileDialog, Ui_MainWindow, create_application
 from services.ai_service import OpenAIService
 from models.account import Info_data
 from workers.process_worker import Worker_Handle
+from integrations.facebook_client import get_account_profile_info, get_managed_page_names
+from utils.account_import import parse_account_import_line
+from utils.facebook_cookies import (
+    build_facebook_playwright_cookies,
+    parse_cookie_header,
+)
 from utils.group_distribution import split_groups_for_accounts
+from utils.proxy_utils import (
+    build_playwright_proxy,
+    build_requests_proxies,
+    check_proxy_status,
+    mask_proxy,
+    parse_proxy,
+    verify_browser_proxy_ip,
+)
+from utils.security import mask_secret
 from app_config import (
     APP_BASE_DIR,
     CHROME_PATH,
-    FACEBOOK_LOGIN_URL,
-    build_profile_path_from_email,
+    build_local_profile_path,
+)
+OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+UID_CHECK_DEFAULT_THREADS = 8
+MANUAL_FACEBOOK_LOGIN_URLS = (
+    "https://m.facebook.com/login/?locale=vi_VN",
+    "https://www.facebook.com/login/?locale=vi_VN",
+    "https://www.facebook.com/login.php?locale=vi_VN",
 )
 
-MAX_PATH = 260
-TH32CS_SNAPPROCESS = 0x00000002
-GWL_STYLE = -16
-GWL_EXSTYLE = -20
-WS_CHILD = 0x40000000
-WS_VISIBLE = 0x10000000
-WS_CAPTION = 0x00C00000
-WS_THICKFRAME = 0x00040000
-WS_POPUP = 0x80000000
-WS_EX_APPWINDOW = 0x00040000
-SW_SHOW = 5
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOZORDER = 0x0004
-SWP_FRAMECHANGED = 0x0020
-WM_CLOSE = 0x0010
+logger = getLogger(__name__)
 
+VIEW_CHROME_URL = "https://www.facebook.com/?locale=vi_VN"
 
-class PROCESSENTRY32W(ctypes.Structure):
-    _fields_ = [
-        ("dwSize", wintypes.DWORD),
-        ("cntUsage", wintypes.DWORD),
-        ("th32ProcessID", wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.c_void_p),
-        ("th32ModuleID", wintypes.DWORD),
-        ("cntThreads", wintypes.DWORD),
-        ("th32ParentProcessID", wintypes.DWORD),
-        ("pcPriClassBase", wintypes.LONG),
-        ("dwFlags", wintypes.DWORD),
-        ("szExeFile", wintypes.WCHAR * MAX_PATH),
-    ]
-
-
-def _collect_process_tree_pids(root_pid: int) -> set[int]:
-    if os.name != "nt" or not root_pid:
-        return {root_pid}
-
-    kernel32 = ctypes.windll.kernel32
-    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snapshot in (0, ctypes.c_void_p(-1).value):
-        return {root_pid}
-
-    processes = []
-    entry = PROCESSENTRY32W()
-    entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-
-    try:
-        if kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
-            while True:
-                processes.append((int(entry.th32ProcessID), int(entry.th32ParentProcessID)))
-                if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
-                    break
-    finally:
-        kernel32.CloseHandle(snapshot)
-
-    pids = {int(root_pid)}
-    changed = True
-    while changed:
-        changed = False
-        for pid, parent_pid in processes:
-            if parent_pid in pids and pid not in pids:
-                pids.add(pid)
-                changed = True
-
-    return pids
-
-
-def _find_chrome_window(root_pid: int):
-    if os.name != "nt" or not root_pid:
-        return None
-
-    user32 = ctypes.windll.user32
-    pids = _collect_process_tree_pids(root_pid)
-    matched_windows = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def enum_windows(hwnd, _):
-        if not user32.IsWindowVisible(hwnd) or user32.GetParent(hwnd):
-            return True
-
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if int(pid.value) not in pids:
-            return True
-
-        class_name = ctypes.create_unicode_buffer(256)
-        user32.GetClassNameW(hwnd, class_name, 256)
-        if class_name.value.startswith("Chrome_WidgetWin"):
-            matched_windows.append(hwnd)
-            return False
-
-        return True
-
-    user32.EnumWindows(enum_windows, 0)
-    return matched_windows[0] if matched_windows else None
-
-
-def _get_window_long(hwnd, index: int):
-    user32 = ctypes.windll.user32
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        user32.GetWindowLongPtrW.restype = ctypes.c_longlong
-        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-        return user32.GetWindowLongPtrW(wintypes.HWND(hwnd), index)
-
-    user32.GetWindowLongW.restype = ctypes.c_long
-    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-    return user32.GetWindowLongW(wintypes.HWND(hwnd), index)
-
-
-def _set_window_long(hwnd, index: int, value: int):
-    user32 = ctypes.windll.user32
-    if ctypes.sizeof(ctypes.c_void_p) == 8:
-        user32.SetWindowLongPtrW.restype = ctypes.c_longlong
-        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_longlong]
-        return user32.SetWindowLongPtrW(wintypes.HWND(hwnd), index, ctypes.c_longlong(value))
-
-    user32.SetWindowLongW.restype = ctypes.c_long
-    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
-    return user32.SetWindowLongW(wintypes.HWND(hwnd), index, ctypes.c_long(value))
-
-
-def _embed_chrome_window(hwnd, parent_hwnd: int):
-    user32 = ctypes.windll.user32
-    user32.SetParent.argtypes = [wintypes.HWND, wintypes.HWND]
-    user32.SetParent(wintypes.HWND(hwnd), wintypes.HWND(parent_hwnd))
-
-    style = int(_get_window_long(hwnd, GWL_STYLE))
-    style = (style & ~(WS_CAPTION | WS_THICKFRAME | WS_POPUP)) | WS_CHILD | WS_VISIBLE
-    _set_window_long(hwnd, GWL_STYLE, style)
-
-    ex_style = int(_get_window_long(hwnd, GWL_EXSTYLE))
-    ex_style = ex_style & ~WS_EX_APPWINDOW
-    _set_window_long(hwnd, GWL_EXSTYLE, ex_style)
-
-    user32.SetWindowPos(
-        wintypes.HWND(hwnd),
-        None,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
-    )
-    user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOW)
-
-
-def _move_chrome_window(hwnd, width: int, height: int):
-    if os.name == "nt" and hwnd:
-        ctypes.windll.user32.MoveWindow(wintypes.HWND(hwnd), 0, 0, max(1, width), max(1, height), True)
-
-
-def _focus_chrome_window(hwnd):
-    if os.name != "nt" or not hwnd:
-        return
-
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    current_thread_id = kernel32.GetCurrentThreadId()
-    target_process_id = wintypes.DWORD()
-    target_thread_id = user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(target_process_id))
-
-    try:
-        if target_thread_id and target_thread_id != current_thread_id:
-            user32.AttachThreadInput(current_thread_id, target_thread_id, True)
-
-        user32.SetFocus(wintypes.HWND(hwnd))
-        user32.SetActiveWindow(wintypes.HWND(hwnd))
-        user32.SetForegroundWindow(wintypes.HWND(hwnd))
-    finally:
-        if target_thread_id and target_thread_id != current_thread_id:
-            user32.AttachThreadInput(current_thread_id, target_thread_id, False)
+# Flag mạng cho cửa sổ Chrome xem tay: chặn QUIC/UDP để proxy đi TCP, tránh treo
+# request; ẩn navigator.webdriver để Facebook không bóp feed động.
+VIEW_CHROME_NETWORK_ARGS = [
+    "--disable-quic",
+    "--disable-features=UseDnsHttpsSvcb,UseDnsHttpsSvcbAlpn,EncryptedClientHello",
+    "--dns-prefetch-disable",
+    "--disable-background-networking",
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--disable-blink-features=AutomationControlled",
+]
 
 
 def ensure_profile_directory(path_chrome: str) -> str:
@@ -206,230 +68,199 @@ def ensure_profile_directory(path_chrome: str) -> str:
     return str(profile_path)
 
 
-class ManualLoginChromeDialog(QDialog):
-    def __init__(self, profile_name: str, profile_path: str, parent=None):
-        super().__init__(parent)
-        self.profile_name = profile_name
-        self.profile_path = profile_path
-        self.chrome_process = None
-        self.chrome_hwnd = None
-        self._started = False
-        self._chrome_closed = False
-        self._attach_attempts = 0
+def proxy_requires_auth(proxy_value: str | None) -> bool:
+    config = parse_proxy(proxy_value)
+    return bool(config and config.has_auth)
 
-        self.setWindowTitle("Mở Chrome / Đăng nhập")
-        self.setMinimumSize(1100, 760)
-        self.resize(1200, 820)
+
+def imported_cookie_status(proxy_value: str | None) -> str:
+    return "Chưa xác thực proxy" if proxy_requires_auth(proxy_value) else "Đã đăng nhập"
+
+
+class ProxyUpdateDialog(QDialog):
+    def __init__(self, current_proxy: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cập nhật proxy")
+        self.setModal(True)
+        self.setMinimumWidth(420)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(10)
 
-        title = QLabel(f"Đăng nhập profile: {profile_name}")
-        title.setStyleSheet("font-size: 16px; font-weight: 700; color: #16243b;")
-        layout.addWidget(title)
+        label = QLabel("Proxy mới")
+        self.proxy_input = QLineEdit()
+        self.proxy_input.setPlaceholderText("ip:port:user:pass hoặc ip:port")
+        self.proxy_input.setText(str(current_proxy or ""))
+        self.proxy_input.selectAll()
 
-        hint = QLabel(
-            "Đăng nhập trong khung Chrome bên dưới. Sau khi hoàn tất, tích "
-            "\"Đã đăng nhập\" rồi bấm Lưu để cập nhật profile vào database."
+        layout.addWidget(label)
+        layout.addWidget(self.proxy_input)
+
+        button_row = QHBoxLayout()
+        self.cancel_btn = QPushButton("Hủy")
+        self.cancel_btn.setStyleSheet(
+            "QPushButton { background:#16a34a; color:white; font-weight:600; padding:7px 16px; border-radius:6px; }"
+            "QPushButton:hover { background:#15803d; }"
         )
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.confirm_btn = QPushButton("Xác nhận")
+        self.confirm_btn.setStyleSheet(
+            "QPushButton { background:#dc2626; color:white; font-weight:600; padding:7px 16px; border-radius:6px; }"
+            "QPushButton:hover { background:#b91c1c; }"
+        )
+        self.cancel_btn.clicked.connect(self.reject)
+        self.confirm_btn.clicked.connect(self.accept)
+        button_row.addWidget(self.cancel_btn)
+        button_row.addWidget(self.confirm_btn)
+        layout.addLayout(button_row)
 
-        self.status_label = QLabel("Đang mở Chrome...")
-        self.status_label.setStyleSheet("color: #31507a; font-weight: 600;")
-        layout.addWidget(self.status_label)
+    def proxy_value(self) -> str:
+        return self.proxy_input.text().strip()
 
-        self.chrome_container = QWidget()
-        self.chrome_container.setMinimumSize(1000, 600)
-        self.chrome_container.setStyleSheet("background: #111827;")
-        layout.addWidget(self.chrome_container, 1)
 
-        action_row = QHBoxLayout()
-        self.logged_in_checkbox = QCheckBox("Đã đăng nhập")
-        action_row.addWidget(self.logged_in_checkbox)
-        action_row.addStretch(1)
+class ManualLoginChromeSession:
+    def __init__(self, profile_name: str, profile_path: str, proxy: str = ""):
+        self.profile_name = profile_name
+        self.profile_path = profile_path
+        self.proxy = proxy or ""
+        self.playwright = None
+        self.context = None
+        self.page = None
 
-        self.save_button = QPushButton("Lưu")
-        self.cancel_button = QPushButton("Hủy")
-        self.save_button.setObjectName("primaryBtn")
-        self.cancel_button.setObjectName("dangerBtn")
-        self.save_button.clicked.connect(self._save_clicked)
-        self.cancel_button.clicked.connect(self.reject)
-        action_row.addWidget(self.save_button)
-        action_row.addWidget(self.cancel_button)
-        layout.addLayout(action_row)
+    def start(self) -> dict:
+        try:
+            proxy_settings = build_playwright_proxy(self.proxy)
+        except Exception as exc:
+            raise RuntimeError(f"Proxy không hợp lệ: {exc}") from exc
 
-        self.attach_timer = QTimer(self)
-        self.attach_timer.setInterval(300)
-        self.attach_timer.timeout.connect(self._attach_chrome_window)
+        masked_proxy = mask_proxy(self.proxy)
 
-        self.resize_timer = QTimer(self)
-        self.resize_timer.setSingleShot(True)
-        self.resize_timer.setInterval(40)
-        self.resize_timer.timeout.connect(self._resize_embedded_chrome)
+        launch_options = self._build_launch_options(proxy_settings)
+        self.playwright = sync_playwright().start()
+        try:
+            self.context = self.playwright.chromium.launch_persistent_context(**launch_options)
+            self.page = self._main_page()
+            self.page.set_default_timeout(30000)
+            self.page.set_default_navigation_timeout(60000)
 
-        self.chrome_container.setAttribute(Qt.WA_NativeWindow, True)
-        self.chrome_container.setAttribute(Qt.WA_DontCreateNativeAncestors, True)
-        self.chrome_container.setFocusPolicy(Qt.StrongFocus)
-        self.chrome_container.installEventFilter(self)
-        self.chrome_container.winId()
+            messages = []
+            if masked_proxy:
+                messages.append(f"Đang dùng proxy Playwright: {masked_proxy}")
+                messages.extend(self._verify_playwright_proxy())
 
-    def eventFilter(self, watched, event):
-        if watched is self.chrome_container and self.chrome_hwnd:
-            if event.type() in (QEvent.MouseButtonPress, QEvent.FocusIn, QEvent.Enter, QEvent.KeyPress):
-                _focus_chrome_window(self.chrome_hwnd)
+            self._open_facebook()
+            messages.append("Đã mở Facebook trong Chrome.")
+            return {
+                "messages": "\n".join(messages),
+            }
+        except Exception:
+            self.close()
+            raise
 
-        return super().eventFilter(watched, event)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self._started:
-            self._started = True
-            QTimer.singleShot(100, self._start_chrome)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._schedule_resize_embedded_chrome()
-
-    def closeEvent(self, event):
-        self._close_chrome()
-        super().closeEvent(event)
-
-    def done(self, result):
-        self._close_chrome()
-        super().done(result)
-
-    def _start_chrome(self):
-        if os.name != "nt":
-            QMessageBox.critical(self, "Lỗi", "Chức năng nhúng Chrome chỉ hỗ trợ trên Windows.")
-            self.reject()
-            return
-
-        chrome_args = [
-            CHROME_PATH,
-            f"--user-data-dir={self.profile_path}",
-            "--new-window",
+    def _build_launch_options(self, proxy_settings) -> dict:
+        args = [
+            "--window-size=1100,760",
+            "--lang=vi-VN",
+            "--accept-lang=vi-VN,vi",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
             "--no-first-run",
             "--no-default-browser-check",
-            "--window-position=-32000,-32000",
-            "--window-size=1100,720",
-            "--disable-features=CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter",
+            "--disable-features=CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter,DisableLoadExtensionCommandLineSwitch,UseDnsHttpsSvcb,EncryptedClientHello",
             "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            "--disable-renderer-accessibility",
             "--disable-spell-checking",
-            "--disable-gpu",
-            FACEBOOK_LOGIN_URL,
+            "--disable-sync",
+            "--disable-quic",
+            "--dns-prefetch-disable",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-extensions",
         ]
 
-        try:
-            self.chrome_container.winId()
-            self.chrome_process = subprocess.Popen(chrome_args)
-        except Exception as exc:
-            QMessageBox.critical(self, "Lỗi", f"Không mở được Chrome:\n{exc}")
-            self.reject()
+        launch_options = {
+            "user_data_dir": self.profile_path,
+            "executable_path": CHROME_PATH,
+            "headless": False,
+            "args": args,
+        }
+        if proxy_settings:
+            launch_options["proxy"] = proxy_settings
+
+        return launch_options
+
+    def _main_page(self):
+        pages = [
+            page
+            for page in self.context.pages
+            if not (page.url or "").startswith("chrome-extension://")
+        ]
+        return pages[0] if pages else self.context.new_page()
+
+    def _verify_playwright_proxy(self) -> list[str]:
+        ip_result = verify_browser_proxy_ip(
+            self.page,
+            self.proxy,
+            timeout_ms=10000,
+            attempts=2,
+            delay_seconds=0.5,
+        )
+        origin = ip_result.get("origin", "")
+        if not ip_result.get("ok"):
+            source = ip_result.get("source_url") or "unknown"
+            error = ip_result.get("error") or "không đọc được IP"
+            if origin:
+                raise RuntimeError(f"Proxy Playwright chưa đúng IP. IP nhận được: {origin} (nguồn: {source})")
+            raise RuntimeError(f"Không kiểm tra được IP proxy Playwright: {error} (nguồn: {source})")
+
+        match_note = ""
+        if ip_result.get("matches_expected") is True:
+            match_note = " đúng IP proxy"
+        elif ip_result.get("matches_expected") is None:
+            match_note = " đã nhận IP"
+        return [
+            "Đang kiểm tra IP qua proxy Playwright...",
+            f"Proxy Playwright OK{match_note}: {origin}",
+        ]
+
+    def _open_facebook(self):
+        if not self.page:
             return
 
-        self.attach_timer.start()
-
-    def _schedule_resize_embedded_chrome(self):
-        if self.chrome_hwnd and not self.resize_timer.isActive():
-            self.resize_timer.start()
-
-    def _attach_chrome_window(self):
-        if not self.chrome_process:
-            return
-
-        if self.chrome_process.poll() is not None:
-            self.attach_timer.stop()
-            self.status_label.setText("Chrome đã đóng.")
-            return
-
-        hwnd = _find_chrome_window(self.chrome_process.pid)
-        if not hwnd:
-            self._attach_attempts += 1
-            if self._attach_attempts >= 80:
-                self.status_label.setText("Chưa nhúng được Chrome, bạn có thể đóng form và thử lại.")
-            return
-
-        self.chrome_hwnd = hwnd
-        self.attach_timer.stop()
-        _embed_chrome_window(self.chrome_hwnd, int(self.chrome_container.winId()))
-        self._resize_embedded_chrome()
-        _focus_chrome_window(self.chrome_hwnd)
-        self.status_label.setText("Chrome đã sẵn sàng trong form.")
-
-    def _resize_embedded_chrome(self):
-        if self.chrome_hwnd:
-            _move_chrome_window(
-                self.chrome_hwnd,
-                self.chrome_container.width(),
-                self.chrome_container.height(),
-            )
-
-    def _save_clicked(self):
-        if not self.logged_in_checkbox.isChecked():
-            QMessageBox.information(
-                self,
-                "Thông báo",
-                "Bạn chưa tích \"Đã đăng nhập\" nên profile chưa được cập nhật.",
-            )
-            return
-
-        self.accept()
-
-    def _close_chrome(self):
-        if self._chrome_closed:
-            return
-
-        self._chrome_closed = True
-        self.attach_timer.stop()
-        self.resize_timer.stop()
-        chrome_process = self.chrome_process
-        chrome_hwnd = self.chrome_hwnd
-        self.chrome_process = None
-        self.chrome_hwnd = None
-
-        if chrome_hwnd and os.name == "nt":
+        last_url = MANUAL_FACEBOOK_LOGIN_URLS[-1]
+        for url in MANUAL_FACEBOOK_LOGIN_URLS:
+            last_url = url
             try:
-                ctypes.windll.user32.PostMessageW(chrome_hwnd, WM_CLOSE, 0, 0)
+                self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                break
+            except Exception:
+                continue
+        else:
+            try:
+                self.page.evaluate("url => window.location.href = url", last_url)
             except Exception:
                 pass
 
-        if chrome_process and chrome_process.poll() is None:
-            QTimer.singleShot(
-                3000,
-                lambda proc=chrome_process: ManualLoginChromeDialog._terminate_chrome_if_needed(proc),
-            )
-
-    @staticmethod
-    def _terminate_chrome_if_needed(chrome_process):
-        if chrome_process.poll() is not None:
-            return
-
         try:
-            chrome_process.terminate()
+            self.page.bring_to_front()
         except Exception:
             pass
 
-        QTimer.singleShot(1500, lambda proc=chrome_process: ManualLoginChromeDialog._kill_chrome_if_needed(proc))
-
-    @staticmethod
-    def _kill_chrome_if_needed(chrome_process):
-        if chrome_process.poll() is not None:
-            return
-
+    def close(self):
         try:
-            chrome_process.kill()
+            if self.context:
+                self.context.close()
         except Exception:
             pass
+        finally:
+            self.context = None
+            self.page = None
 
         try:
-            chrome_process.wait(timeout=0)
+            if self.playwright:
+                self.playwright.stop()
         except Exception:
             pass
+        finally:
+            self.playwright = None
 
 
 class MainWindow(QMainWindow):
@@ -455,8 +286,13 @@ class MainWindow(QMainWindow):
         self.pending_action_mode = "crawl"
         self.max_threads = self.uic.spn_threads.value()
         self.stop_requested = False
-        self.view_chrome = None
+        self.view_chrome_playwright = None
+        self.view_chrome_context = None
+        self.view_chrome_page = None
+        self.view_chrome_timer = None
+        self.view_chrome_row = None
         self.view_chrome_path = None
+        self._view_chrome_closed_flag = False
         self.is_running = False
 
         self._connect_signals()
@@ -482,7 +318,7 @@ class MainWindow(QMainWindow):
         self.uic.table.horizontalHeader().sectionClicked.connect(self.on_table_header_clicked)
 
     def append_log(self, text: str):
-        self.uic.console.append(text)
+        self.uic.console.append(str(text or ""))
 
     def clear_log(self):
         self.uic.console.clear()
@@ -526,6 +362,9 @@ class MainWindow(QMainWindow):
         item = self.uic.table.item(row, 0)
         return bool(item and item.checkState() == Qt.Checked)
 
+    def _is_valid_table_row(self, row: int) -> bool:
+        return isinstance(row, int) and 0 <= row < self.uic.table.rowCount()
+
     def _set_row_checked(self, row: int, checked: bool):
         checkbox = self._row_checkbox(row)
         if checkbox is not None:
@@ -544,16 +383,15 @@ class MainWindow(QMainWindow):
         return bool(left and right and self._normalize_path(left) == self._normalize_path(right))
 
     def _sync_view_chrome_state(self):
-        if self.view_chrome and self.view_chrome.poll() is not None:
-            closed_profile_name = os.path.basename(self.view_chrome_path or "")
-            self.view_chrome = None
-            self.view_chrome_path = None
-            if closed_profile_name:
-                self.append_log(f"Đã đóng Chrome profile: {closed_profile_name}")
+        # Chrome chạy trên main thread, giữ sống bằng QTimer bơm pipe CDP.
+        # Khi user bấm X, context "close" -> _view_chrome_closed_flag = True;
+        # ở đây dọn state (đóng playwright, tắt timer) nếu đã đánh dấu đóng.
+        if self.view_chrome_path and self._view_chrome_closed_flag:
+            self._teardown_view_chrome()
 
     def _is_view_chrome_running(self) -> bool:
         self._sync_view_chrome_state()
-        return self.view_chrome is not None and self.view_chrome.poll() is None
+        return bool(self.view_chrome_path)
 
     def _is_profile_running_in_worker(self, path_chrome: str) -> bool:
         normalized_path = self._normalize_path(path_chrome)
@@ -608,35 +446,19 @@ class MainWindow(QMainWindow):
         db = AccountDB(None)
         profile_name = profile["profile_name"]
 
-        account_name = db.find_account_name_from_path_chrome(profile_name)
-        path_profile = db.find_full_path_from_path_chrome(profile_name)
-        proxy = db.find_proxy_from_path_chrome(profile_name)
-        info_account = db.find_info_account_from_path_chrome(profile_name)
-        cookie = db.find_cookie_from_path_chrome(profile_name)
-        token = db.find_token_from_path_chrome(profile_name)
-        post_count = db.find_post_count_from_path_chrome(profile_name)
-
-        email, password, twofa = "", "", ""
-        if info_account:
-            info_parts = info_account.split("|", 2)
-            if len(info_parts) == 3:
-                email, password, twofa = info_parts
-            elif len(info_parts) == 2:
-                email, password = info_parts
-            elif len(info_parts) == 1:
-                email = info_parts[0]
+        account = db.find_account_from_path_chrome(profile_name) or {}
 
         return Info_data(
             row=profile["row"],
-            account_name=account_name or "",
-            path_chrome=path_profile or "",
-            proxy=proxy or "",
-            email=email or "",
-            password=password or "",
-            twofa=twofa or "",
-            cookie=cookie or "",
-            token=token or "",
-            post_count=str(post_count or ""),
+            account_name=account.get("Account_Name") or "",
+            path_chrome=account.get("Path_Chrome") or "",
+            proxy=account.get("Proxy") or "",
+            email=account.get("Email") or "",
+            password=account.get("Password") or "",
+            twofa=account.get("Twofa") or "",
+            cookie=account.get("Cookie") or "",
+            token=account.get("Token") or "",
+            post_count=str(account.get("Post_Count") or ""),
             api_key=self.api_key or "",
             groups_list=[],
             prompt="",
@@ -650,32 +472,71 @@ class MainWindow(QMainWindow):
         )
 
     def update_interact_group(self, row: int, text: str):
+        if not self._is_valid_table_row(row):
+            return
         item = QTableWidgetItem(text)
         item.setTextAlignment(Qt.AlignCenter)
         self.uic.table.setItem(row, 5, item)
 
     def on_row_signal(self, row: int, text: str):
-        item = QTableWidgetItem(format_status_text(text))
+        if not self._is_valid_table_row(row):
+            return
+        item = QTableWidgetItem(str(text or ""))
         item.setTextAlignment(Qt.AlignCenter)
         self.uic.table.setItem(row, 6, item)
 
     def on_task_finished(self, row: int, text: str):
-        item = QTableWidgetItem(format_status_text(text))
+        if not self._is_valid_table_row(row):
+            return
+        item = QTableWidgetItem(str(text or ""))
         item.setTextAlignment(Qt.AlignCenter)
         self.uic.table.setItem(row, 6, item)
 
+    @staticmethod
+    def _split_page_names(page_names: str) -> list[str]:
+        names = []
+        seen = set()
+        for name in str(page_names or "").replace("|", "\n").splitlines():
+            normalized_name = " ".join(name.split()).strip()
+            if not normalized_name:
+                continue
+            key = normalized_name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(normalized_name)
+        return names
+
+    def _format_page_cell_text(self, page_count: int | str, page_names: str = "") -> str:
+        try:
+            count_value = int(page_count or 0)
+        except (TypeError, ValueError):
+            count_value = 0
+
+        return str(count_value)
+
     def on_page_signal(self, row: int, page_count: int):
-        item = QTableWidgetItem(str(page_count))
-        item.setTextAlignment(Qt.AlignCenter)
+        if not self._is_valid_table_row(row):
+            return
         existing_item = self.uic.table.item(row, 4)
-        if existing_item and existing_item.toolTip():
-            item.setToolTip(existing_item.toolTip())
+        page_names = existing_item.toolTip() if existing_item else ""
+        item = QTableWidgetItem(self._format_page_cell_text(page_count, page_names))
+        item.setTextAlignment(Qt.AlignCenter)
+        item.setData(Qt.UserRole, int(page_count or 0))
+        if page_names:
+            item.setToolTip(page_names)
         self.uic.table.setItem(row, 4, item)
 
     def on_page_names_signal(self, row: int, page_names: str):
+        if not self._is_valid_table_row(row):
+            return
         item = self.uic.table.item(row, 4)
         if item is not None:
             item.setToolTip(page_names or "")
+            page_count = item.data(Qt.UserRole)
+            if page_count is None:
+                page_count = str(item.text()).split("|", 1)[0].strip()
+            item.setText(self._format_page_cell_text(page_count, page_names))
 
     def _create_worker(self, task: Info_data, action_mode: str = "crawl") -> Worker_Handle:
         worker = Worker_Handle(task.row, task, action_mode=action_mode)
@@ -716,6 +577,7 @@ class MainWindow(QMainWindow):
             was_stopping = self.stop_requested
             self.is_running = False
             self.stop_requested = False
+            self.uic.spn_threads.setEnabled(True)
             if should_log:
                 if was_stopping:
                     self.append_log("Đã dừng tất cả worker.")
@@ -723,6 +585,8 @@ class MainWindow(QMainWindow):
                     self.append_log("Tất cả worker đã kết thúc.")
 
     def on_post_signal(self, row: int, status: int):
+        if not self._is_valid_table_row(row):
+            return
         item = QTableWidgetItem(str(status))
         item.setTextAlignment(Qt.AlignCenter)
         self.uic.table.setItem(row, 7, item)
@@ -763,8 +627,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        configured_threads = max(1, int(self.uic.spn_threads.value()))
-        tasks = self.build_data(max_active_accounts=configured_threads)
+        tasks = self.build_data(max_active_accounts=None)
         if not tasks:
             return
 
@@ -782,12 +645,19 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        self.max_threads = min(configured_threads, len(tasks))
+        # Crawl worker chạy vòng lặp vô hạn (không tự kết thúc), nên account bị
+        # xếp hàng chờ luồng sẽ không bao giờ được crawl. Vì vậy chạy tất cả
+        # account đã chọn cùng lúc; "Số luồng" không giới hạn crawl flow nữa.
+        self.max_threads = len(tasks)
         self.pending_tasks = list(tasks)
         self.pending_action_mode = "crawl"
         self.workers.clear()
         self.stop_requested = False
         self.is_running = True
+        reset_posts_json()
+        # Crawl chạy tất cả account cùng lúc nên "Số luồng" không còn tác dụng ở
+        # đây; khóa lại khi đang crawl để tránh nhầm là nó giới hạn luồng.
+        self.uic.spn_threads.setEnabled(False)
         self.append_log(
             f"Bắt đầu chạy tool với {self.max_threads} luồng / {len(tasks)} task."
         )
@@ -834,6 +704,7 @@ class MainWindow(QMainWindow):
             self.append_log("Một số worker vẫn chưa dừng hẳn.")
         else:
             self.stop_requested = False
+            self.uic.spn_threads.setEnabled(True)
             self.append_log("Đã dừng tất cả worker.")
 
     def load_table(self):
@@ -845,11 +716,11 @@ class MainWindow(QMainWindow):
                 self.insert_row(
                     data.get('Account_Name', ''),
                     os.path.basename(data.get('Path_Chrome', '')).split("\\")[-1],
-                    format_proxy_text(data.get('Proxy', '')),
+                    data.get('Proxy', ''),
                     data.get('Page_Count', 0),
                     data.get('Page_Names', ''),
                     "",
-                    format_status_text(data.get('Status', '')),
+                    data.get('Status', ''),
                     data.get('Post_Count', ''),
                 )
 
@@ -858,31 +729,109 @@ class MainWindow(QMainWindow):
             pass
 
     
-    def _parse_profile_line(self, line: str, normal_mode: bool):
-        parts = [part.strip() for part in line.split('|')]
+    def _parse_profile_line(self, line: str, normal_mode: bool = True):
+        parsed_profile = parse_account_import_line(line)
+        parsed_profile["path_chrome"] = ensure_profile_directory(
+            str(build_local_profile_path(parsed_profile["uid"]))
+        )
+        return parsed_profile
 
-        if normal_mode:
-            if len(parts) != 4:
-                raise ValueError("Định dạng đúng: tên tài khoản|email|password|2FA")
-            account_name, email, password, twofa = parts
-            proxy = "Không"
-        else:
-            if len(parts) != 5:
-                raise ValueError("Định dạng đúng: tên tài khoản|proxy|email|password|2FA")
-            account_name, proxy, email, password, twofa = parts
+    def _seed_profile_with_facebook_cookie(self, profile_path: str, cookie: str, proxy: str = "") -> bool:
+        cookies = build_facebook_playwright_cookies(cookie)
+        if not cookies:
+            return False
 
-        if not account_name:
-            raise ValueError("Thiếu tên tài khoản")
+        # LUỒNG 1 Bước 3: mở Chrome headless KÈM PROXY (kỹ thuật giống test.py:
+        # truyền proxy dict vào launch_persistent_context, KHÔNG dùng --no-proxy-server
+        # và KHÔNG bật context.route interception -> proxy auth hoạt động).
+        proxy_settings = build_playwright_proxy(proxy)
 
-        path_chrome = ensure_profile_directory(build_profile_path_from_email(email))
+        args = [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-sync",
+            "--window-position=-32000,-32000",
+            "--window-size=1,1",
+            "--disable-gpu",
+            "--disable-software-rasterizer",
+        ]
+        launch_options = {
+            "user_data_dir": profile_path,
+            "executable_path": CHROME_PATH,
+            "headless": True,
+            "args": args,
+        }
+        if proxy_settings:
+            launch_options["proxy"] = proxy_settings
 
+        playwright = sync_playwright().start()
+        context = None
+        try:
+            context = playwright.chromium.launch_persistent_context(**launch_options)
+            context.clear_cookies(domain=re.compile(r"(^|\.)facebook\.com$"))
+            context.add_cookies(cookies)
+
+            stored_cookie_names = {
+                item.get("name")
+                for item in context.cookies([
+                    "https://facebook.com",
+                    "https://www.facebook.com",
+                    "https://m.facebook.com",
+                ])
+            }
+            if not {"c_user", "xs"}.issubset(stored_cookie_names):
+                return False
+
+            # Mở Facebook để trình duyệt nhận session đăng nhập từ cookie.
+            pages = [
+                page
+                for page in context.pages
+                if not (page.url or "").startswith("chrome-extension://")
+            ]
+            page = pages[0] if pages else context.new_page()
+            try:
+                page.goto(
+                    "https://www.facebook.com/?locale=vi_VN",
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+            except Exception as exc:
+                self.append_log(f"Đã gắn cookie nhưng chưa mở được Facebook qua proxy: {exc}")
+            return True
+        finally:
+            try:
+                if context:
+                    context.close()
+            finally:
+                playwright.stop()
+
+    def _update_imported_account_graph_info(self, parsed_profile: dict) -> dict:
+        proxies = build_requests_proxies(parsed_profile.get("proxy", ""))
+        profile_info = get_account_profile_info(
+            parsed_profile["token"],
+            account_cookies=parsed_profile["cookie"],
+            proxies=proxies,
+        )
+        account_name = profile_info.get("name") or parsed_profile["uid"]
+        page_names = get_managed_page_names(
+            parsed_profile["token"],
+            account_cookies=parsed_profile["cookie"],
+            account_name=account_name,
+            proxies=proxies,
+        )
+
+        db = AccountDB(None)
+        db.update_account_name_by_path(parsed_profile["path_chrome"], account_name)
+        db.update_page_info_by_path(
+            parsed_profile["path_chrome"],
+            len(page_names),
+            "\n".join(page_names),
+        )
         return {
             "account_name": account_name,
-            "proxy": format_proxy_text(proxy),
-            "email": email.strip(),
-            "password": password.strip(),
-            "twofa": twofa.strip(),
-            "path_chrome": path_chrome,
+            "page_count": len(page_names),
+            "page_names": page_names,
         }
 
     def open_profile_dialog(self):
@@ -892,24 +841,35 @@ class MainWindow(QMainWindow):
 
         raw_lines = [line.strip() for line in dialog.editor.toPlainText().splitlines() if line.strip()]
         if not raw_lines:
-            QMessageBox.warning(self, 'Cảnh báo', 'Chưa có dữ liệu tài khoản.')
+            QMessageBox.warning(self, "Cảnh báo", "Chưa có dữ liệu tài khoản.")
             return
 
-        normal_mode = dialog.radio_normal.isChecked()
-        mode_label = "Profile Chrome" if normal_mode else "Profile Chrome - Proxy"
+        mode_label = "Cookie/Token"
         db = AccountDB(None)
         created_count = 0
         updated_count = 0
+        seeded_count = 0
+        page_updated_count = 0
 
         for line_number, line in enumerate(raw_lines, start=1):
             try:
-                parsed_profile = self._parse_profile_line(line, normal_mode)
-                action = db.save_account_profile(**parsed_profile)
+                parsed_profile = self._parse_profile_line(line)
+                action = db.save_imported_cookie_account(
+                    uid=parsed_profile["uid"],
+                    password=parsed_profile["password"],
+                    cookie=parsed_profile["cookie"],
+                    token=parsed_profile["token"],
+                    email=parsed_profile["email"],
+                    mail_password=parsed_profile["mail_password"],
+                    twofa=parsed_profile["twofa"],
+                    path_chrome=parsed_profile["path_chrome"],
+                    proxy=parsed_profile["proxy"],
+                )
             except Exception as exc:
                 QMessageBox.warning(
                     self,
-                    'Cảnh báo',
-                    f'Dòng {line_number} không hợp lệ:\n{exc}',
+                    "Cảnh báo",
+                    f"Dòng {line_number} không hợp lệ:\n{exc}",
                 )
                 return
 
@@ -918,11 +878,61 @@ class MainWindow(QMainWindow):
             else:
                 updated_count += 1
 
+            path_chrome = parsed_profile["path_chrome"]
+
+            # LUỒNG 1 - Bước 1: Check Proxy (IPv4/IPv6). Fail -> dừng dòng này.
+            if parsed_profile.get("proxy"):
+                proxy_result = check_proxy_status(parsed_profile["proxy"])
+                if not proxy_result.get("ok"):
+                    db.update_status_by_path(path_chrome, "Proxy hết hạn / lỗi")
+                    self.append_log(
+                        f"Dòng {line_number}: {proxy_result.get('message') or 'Proxy hết hạn / lỗi'}"
+                    )
+                    continue
+
+            # LUỒNG 1 - Bước 2: Check Account bằng cookie+token qua Graph API.
+            # Fail -> Status "Tài khoản không hoạt động", dừng dòng này.
+            try:
+                graph_info = self._update_imported_account_graph_info(parsed_profile)
+                page_updated_count += 1
+                page_names_text = ", ".join(graph_info.get("page_names") or [])
+                if page_names_text:
+                    page_names_text = f" | Page: {page_names_text}"
+                self.append_log(
+                    f"Dòng {line_number}: đã cập nhật {graph_info.get('page_count') or 0} page "
+                    f"cho {graph_info.get('account_name') or parsed_profile['uid']}"
+                    f"{page_names_text}"
+                )
+            except Exception as exc:
+                db.update_status_by_path(path_chrome, "Tài khoản không hoạt động")
+                self.append_log(f"Dòng {line_number}: tài khoản không hoạt động: {exc}")
+                continue
+
+            # LUỒNG 1 - Bước 3: Mở Chrome headless KÈM PROXY (kỹ thuật test.py),
+            # gắn cookie, mở Facebook để nhận session đăng nhập.
+            try:
+                if self._seed_profile_with_facebook_cookie(
+                    path_chrome,
+                    parsed_profile["cookie"],
+                    parsed_profile.get("proxy", ""),
+                ):
+                    seeded_count += 1
+                    db.update_status_by_path(path_chrome, "Đã đăng nhập")
+                else:
+                    db.update_status_by_path(path_chrome, "Đã nhập cookie")
+                    self.append_log(
+                        f"Dòng {line_number}: chưa xác nhận được session sau khi gắn cookie."
+                    )
+            except Exception as exc:
+                db.update_status_by_path(path_chrome, "Đã nhập cookie")
+                self.append_log(f"Dòng {line_number}: chưa nạp được cookie vào profile Chrome: {exc}")
+
         self.load_table()
 
         summary_text = (
             f"Đã lưu {len(raw_lines)} tài khoản | Chế độ: {mode_label}"
             f" | Tạo mới: {created_count} | Cập nhật: {updated_count}"
+            f" | Nạp cookie profile: {seeded_count} | Cập nhật page: {page_updated_count}"
         )
         self.uic.profile_info.setText(summary_text)
         self.append_log(summary_text)
@@ -989,7 +999,7 @@ class MainWindow(QMainWindow):
             token_tele = data.get("token_tele", "").strip()
 
             if not id_chat or not token_tele:
-                QMessageBox.warning(self, "Lỗi", "File JSON thiếu id_chat hoặc token_tele!")
+                QMessageBox.warning(self, "Lỗi", "File JSON thiếu id_chat hoặc token_tele.")
                 return
 
             self.tele_file_path = path
@@ -999,35 +1009,46 @@ class MainWindow(QMainWindow):
 
             self.append_log("Đã import TELE:")
             self.append_log(f" - Chat ID: {id_chat}")
-            self.append_log(f" - Token: {token_tele[:10]}********")
+            self.append_log(f" - Token: {mask_secret(token_tele)}")
 
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không đọc được file JSON:\n{e}")
 
     def check_api_key(self):
-        api_key = self.uic.api_edit.text().strip()
-        if api_key == "demo":
-            api_key = "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"
+        raw_api_key = self.uic.api_edit.text().strip()
+        api_key_source = "ô nhập"
+        if raw_api_key.casefold() == "demo":
+            raw_api_key = ""
+            self.append_log("Kiểm tra key: đã tắt key demo, thử dùng OPENAI_API_KEY.")
+
+        api_key = raw_api_key or os.environ.get(OPENAI_API_KEY_ENV, "").strip()
+        if not raw_api_key and api_key:
+            api_key_source = f"biến môi trường {OPENAI_API_KEY_ENV}"
+
         if not api_key:
-            QMessageBox.warning(self, "Thiếu dữ liệu", "Vui lòng nhập API key trước khi kiểm tra.")
+            QMessageBox.warning(
+                self,
+                "Thiếu API key",
+                f"Nhập API key hoặc đặt biến môi trường {OPENAI_API_KEY_ENV}.",
+            )
             return
 
         prefix_ok = api_key.startswith('sk-')
         length_ok = len(api_key) >= 20
         if not prefix_ok or not length_ok:
-            QMessageBox.warning(self, 'Kiểm tra key', 'API key có vẻ không đúng định dạng cơ bản.')
-            self.append_log('Check key: key không đúng định dạng cơ bản.')
+            QMessageBox.warning(self, "Kiểm tra key", "Định dạng API key không hợp lệ.")
+            self.append_log(f"Kiểm tra key: định dạng API key không hợp lệ ({mask_secret(api_key)}).")
             return
 
         try:
-            model_name = 'gpt-5.4-nano'
+            model_name = 'gpt-5-mini'
             service = OpenAIService(api_key=api_key, model=model_name, timeout=20)
             result = service.check_api_key()
 
             if not result.get('valid'):
-                msg = f"API key không hợp lệ.\n\nKey: {result.get('masked_key', '')}\nLý do: {result.get('message', 'Không xác định')}"
-                QMessageBox.warning(self, 'Kiểm tra key', msg)
-                self.append_log(f"Check key fail: {result.get('message', '')}")
+                msg = f"API key không hợp lệ.\n\nKey: {result.get('masked_key', '')}\nLý do: {result.get('message', 'Không rõ')}"
+                QMessageBox.warning(self, "Kiểm tra key", msg)
+                self.append_log(f"Kiểm tra key thất bại: {result.get('message', '')}")
                 return
 
             sample_models = result.get('sample_models', [])
@@ -1036,25 +1057,22 @@ class MainWindow(QMainWindow):
                 f"API key hợp lệ\n\n"
                 f"Key: {result.get('masked_key', '')}\n"
                 f"Model mặc định: {result.get('default_model', '')}\n"
-                f"Dùng được model mặc định: {'Có' if result.get('default_model_ok') else 'Không'}\n"
-                f"Tổng model thấy được: {result.get('models_count', 0)}\n\n"
+                f"Model mặc định khả dụng: {'Có' if result.get('default_model_ok') else 'Không'}\n"
+                f"Số model thấy được: {result.get('models_count', 0)}\n\n"
                 f"Một số model khả dụng:\n{sample_models_text}\n"
             )
-            QMessageBox.information(self, 'Kiểm tra key', info_text)
-            self.append_log('Check key: API key hợp lệ, đã lấy thông tin model.')
+            QMessageBox.information(self, "Kiểm tra key", info_text)
+            self.append_log(f"Kiểm tra key: API key hợp lệ, đã lấy thông tin model từ {api_key_source}.")
             self.api_key = api_key
 
         except Exception as e:
-            QMessageBox.critical(self, 'Kiểm tra key', f'Lỗi khi kiểm tra API key:\n{e}')
-            self.append_log(f'Check key exception: {e}')
+            QMessageBox.critical(self, "Kiểm tra key", f"Lỗi khi kiểm tra API key:\n{e}")
+            self.append_log(f"Kiểm tra key lỗi: {e}")
 
     @staticmethod
     def count_non_empty_lines(path: str) -> int:
         try:
             with open(path, "r", encoding="utf-8") as file:
-                return sum(1 for line in file if line.strip())
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="utf-8-sig", errors="ignore") as file:
                 return sum(1 for line in file if line.strip())
         except Exception:
             return 0
@@ -1066,9 +1084,6 @@ class MainWindow(QMainWindow):
 
         try:
             with open(path, "r", encoding="utf-8") as file:
-                return file.read().strip()
-        except UnicodeDecodeError:
-            with open(path, "r", encoding="utf-8-sig", errors="ignore") as file:
                 return file.read().strip()
         except Exception:
             return ""
@@ -1119,7 +1134,7 @@ class MainWindow(QMainWindow):
             selected_accounts.append((account_id, profile["full_path"]))
 
         if not selected_accounts:
-            QMessageBox.warning(self, "Thông báo", "Chưa có profiles nào được chọn!")
+            QMessageBox.warning(self, "Thông báo", "Chưa có profile nào được chọn!")
             return
 
         for _, full_path in selected_accounts:
@@ -1142,7 +1157,7 @@ class MainWindow(QMainWindow):
         delete_accept = QMessageBox.question(
             self,
             'Xác nhận',
-            f'Xác nhận xóa {len(selected_accounts)} profiles ?',
+            f'Xác nhận xóa {len(selected_accounts)} profiles?',
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -1159,7 +1174,7 @@ class MainWindow(QMainWindow):
         self.load_table()
 
     def _set_item(self, row, col, value, align):
-        item = QTableWidgetItem(str(value))
+        item = QTableWidgetItem(str(value or ""))
         item.setTextAlignment(int(align))
         self.uic.table.setItem(row, col, item)
         return item
@@ -1173,12 +1188,21 @@ class MainWindow(QMainWindow):
 
         self._set_item(row, 1, account_name, Qt.AlignHCenter | Qt.AlignVCenter)
         self._set_item(row, 2, path_chrome, Qt.AlignHCenter | Qt.AlignVCenter)
-        self._set_item(row, 3, format_proxy_text(proxy), Qt.AlignHCenter | Qt.AlignVCenter)
-        page_item = self._set_item(row, 4, page_count, Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 3, proxy, Qt.AlignHCenter | Qt.AlignVCenter)
+        page_item = self._set_item(
+            row,
+            4,
+            self._format_page_cell_text(page_count, page_names),
+            Qt.AlignHCenter | Qt.AlignVCenter,
+        )
+        try:
+            page_item.setData(Qt.UserRole, int(page_count or 0))
+        except (TypeError, ValueError):
+            page_item.setData(Qt.UserRole, 0)
         if page_names:
             page_item.setToolTip(page_names)
         self._set_item(row, 5, interact, Qt.AlignHCenter | Qt.AlignVCenter)
-        self._set_item(row, 6, format_status_text(status), Qt.AlignHCenter | Qt.AlignVCenter)
+        self._set_item(row, 6, status, Qt.AlignHCenter | Qt.AlignVCenter)
         self._set_item(row, 7, post_count, Qt.AlignHCenter | Qt.AlignVCenter)
 
     def show_menu(self, pos):
@@ -1186,28 +1210,35 @@ class MainWindow(QMainWindow):
             return
 
         menu = QMenu(self)
-        copy_path_ = menu.addAction("📋 Copy đường dẫn Chrome")
+        copy_path_ = menu.addAction("📋 Copy đường dẫn profile")
         copy_proxy = menu.addAction("🌍 Copy proxy (tài nguyên)")
-        copy_info_account = menu.addAction("📧 Copy mail|pass|2FA")
+        update_proxy = menu.addAction("♻️ Cập nhật proxy")
+        copy_info_account = menu.addAction("📧 Copy mail|pass|pass_mail")
         copy_token = menu.addAction("🔑 Copy token (tài nguyên)")
         copy_cookie = menu.addAction("🍪 Copy cookie (tài nguyên)")
-        update_page_names = menu.addAction("📄 Cập nhật tên page")
         open_chrome = menu.addAction("🌐 Mở Chrome / Đăng nhập")
         menu.addSeparator()
-        check_login = menu.addAction("✅ Kiểm tra đăng nhập")
+        refresh_pages = menu.addAction("👥 Cập nhật page mới")
+        check_uid_status = menu.addAction("✅ Kiểm tra UID sống/chết")
 
         selected_action = menu.exec(self.uic.table.viewport().mapToGlobal(pos))
         if selected_action is None:
             return
 
-        if selected_action == check_login:
+        if selected_action == refresh_pages:
             if self._require_checked_profiles(allow_multiple=True):
-                self.check_login_selected_accounts()
+                self.refresh_pages_selected_accounts()
             return
 
-        if selected_action == update_page_names:
+        if selected_action == check_uid_status:
             if self._require_checked_profiles(allow_multiple=True):
-                self.update_page_names_selected_accounts()
+                self.check_uid_status_selected_accounts()
+            return
+
+        if selected_action == update_proxy:
+            profiles = self._require_checked_profiles(allow_multiple=True)
+            if profiles:
+                self.update_proxy_selected_accounts(profiles)
             return
 
         if not self._require_checked_profiles(allow_multiple=False):
@@ -1231,7 +1262,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Thông báo", "Đang có tiến trình chạy. Vui lòng dừng trước khi chạy chức năng khác.")
             return
 
-        if self._is_view_chrome_running():
+        if action_mode not in ("check_uid_status", "refresh_page_data") and self._is_view_chrome_running():
             conflict_profile = next(
                 (profile for profile in profiles if self._same_profile_path(profile["full_path"], self.view_chrome_path)),
                 None,
@@ -1261,7 +1292,21 @@ class MainWindow(QMainWindow):
 
         self._start_pending_workers()
 
-    def check_login_selected_accounts(self):
+    def check_uid_status_selected_accounts(self):
+        profiles = self._require_checked_profiles(allow_multiple=True)
+        if not profiles:
+            return
+
+        configured_threads = max(1, int(self.uic.spn_threads.value()))
+        default_threads = min(len(profiles), UID_CHECK_DEFAULT_THREADS)
+        self._start_account_action(
+            profiles=profiles,
+            action_mode="check_uid_status",
+            label="kiểm tra UID sống/chết",
+            max_threads=max(configured_threads, default_threads),
+        )
+
+    def refresh_pages_selected_accounts(self):
         profiles = self._require_checked_profiles(allow_multiple=True)
         if not profiles:
             return
@@ -1269,45 +1314,59 @@ class MainWindow(QMainWindow):
         configured_threads = max(1, int(self.uic.spn_threads.value()))
         self._start_account_action(
             profiles=profiles,
-            action_mode="check_login",
-            label="kiểm tra đăng nhập",
+            action_mode="refresh_page_data",
+            label="cập nhật page mới",
             max_threads=configured_threads,
         )
 
-    def update_page_names_selected_accounts(self):
-        profiles = self._require_checked_profiles(allow_multiple=True)
+    def update_proxy_selected_accounts(self, profiles: list[dict]):
         if not profiles:
             return
 
-        configured_threads = max(1, int(self.uic.spn_threads.value()))
-        self._start_account_action(
-            profiles=profiles,
-            action_mode="refresh_page_names",
-            label="cập nhật tên page",
-            max_threads=configured_threads,
-        )
+        current_values = []
+        for profile in profiles:
+            item = self.uic.table.item(profile["row"], 3)
+            current_values.append(item.text().strip() if item else "")
+        current_proxy = current_values[0] if len(set(current_values)) == 1 else ""
 
-    def _start_manual_login_refresh(self, selected_profile: dict, saved_path: str, profile_name: str):
-        refresh_profile = dict(selected_profile)
-        refresh_profile["profile_name"] = os.path.basename(saved_path)
-        refresh_profile["full_path"] = saved_path
+        dialog = ProxyUpdateDialog(current_proxy=current_proxy, parent=self)
+        if dialog.exec_() != QDialog.Accepted:
+            return
 
-        def start_refresh():
-            if self.is_running:
-                self.append_log(
-                    f"Chưa cập nhật số page cho profile {profile_name} vì tool đang chạy."
+        new_proxy = dialog.proxy_value()
+        # if not new_proxy:
+        #     QMessageBox.warning(self, "Thông báo", "Proxy mới không được để trống.")
+        #     return
+
+        try:
+            parse_proxy(new_proxy)
+        except Exception as exc:
+            QMessageBox.warning(self, "Thông báo", f"Proxy không hợp lệ:\n{exc}")
+            return
+
+        db = AccountDB(None)
+        updated_count = 0
+        failed_profiles = []
+        for profile in profiles:
+            if db.update_proxy_by_path(profile["full_path"], new_proxy):
+                updated_count += 1
+                self._set_item(
+                    profile["row"],
+                    3,
+                    new_proxy,
+                    Qt.AlignHCenter | Qt.AlignVCenter,
                 )
-                return
+            else:
+                failed_profiles.append(profile["profile_name"])
 
-            self._start_account_action(
-                profiles=[refresh_profile],
-                action_mode="refresh_login_data",
-                label="cập nhật số page sau đăng nhập thủ công",
-                max_threads=1,
+        if failed_profiles:
+            QMessageBox.warning(
+                self,
+                "Thông báo",
+                "Không cập nhật được proxy cho:\n" + "\n".join(failed_profiles),
             )
 
-        self.append_log(f"Sẽ cập nhật cookie/token và số page cho profile: {profile_name}")
-        QTimer.singleShot(3500, start_refresh)
+        self.append_log(f"Đã cập nhật proxy cho {updated_count} tài khoản.")
 
     def copy_path(self):
         checked_paths = []
@@ -1316,10 +1375,10 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_full_path_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy đường dẫn Chrome.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy đường dẫn profile.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} đường dẫn Chrome.')
+        QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} đường dẫn profile.')
 
     def copy_proxy(self):
         checked_paths = []
@@ -1328,10 +1387,10 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_proxy_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy proxy.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy proxy.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} proxy.')
+        QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} proxy.')
 
     def copy_info_account(self):
         checked_paths = []
@@ -1340,10 +1399,10 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_info_account_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy mail|pass|2FA.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy mail|pass|pass_mail.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} mail|pass|2FA.')
+        QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} mail|pass|pass_mail.')
 
     def copy_token(self):
         checked_paths = []
@@ -1352,10 +1411,10 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_token_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy token.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy token.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} token.')
+        QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} token.')
 
     def copy_cookie(self):
         checked_paths = []
@@ -1364,74 +1423,216 @@ class MainWindow(QMainWindow):
                 profile_name = self.uic.table.item(row, 2).text()
                 checked_paths.append(AccountDB(None).find_cookie_from_path_chrome(profile_name))
         if not checked_paths:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy cookie.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để copy cookie.')
             return
         QApplication.clipboard().setText('\n'.join(checked_paths))
-        QMessageBox.information(self, 'Copied', f'Đã copy {len(checked_paths)} cookie.')
+        QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} cookie.')
 
     def open_chrome(self):
         checked_profiles = self._collect_checked_profiles()
         if not checked_profiles:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để mở Chrome.')
+            QMessageBox.warning(self, "Lỗi", "Vui lòng tích chọn ít nhất 1 tài khoản để mở Chrome.")
             return
 
         if len(checked_profiles) > 1:
-            QMessageBox.information(self, 'Thông báo', 'Chỉ nên chọn 1 profile khi mở Chrome.')
+            QMessageBox.information(self, "Thông báo", "Chỉ nên chọn 1 profile khi mở Chrome.")
             return
 
         selected_profile = checked_profiles[0]
         profile_path = ensure_profile_directory(selected_profile["full_path"])
         profile_name = selected_profile["profile_name"]
+        db = AccountDB(None)
+        profile_proxy = db.find_proxy_from_path_chrome(profile_name)
+        profile_cookie = db.find_cookie_from_path_chrome(profile_name)
 
         if self._is_profile_running_in_worker(profile_path):
             QMessageBox.warning(
                 self,
-                'Thông báo',
-                f'Profile {profile_name} đang được worker sử dụng. Hãy dừng worker trước khi mở Chrome tay.',
+                "Thông báo",
+                f"Profile {profile_name} đang được worker sử dụng. Hãy dừng worker trước khi mở Chrome tay.",
             )
             return
 
         if self._is_view_chrome_running():
             if self._same_profile_path(profile_path, self.view_chrome_path):
-                QMessageBox.information(self, 'Thông báo', f'Profile {profile_name} đang mở Chrome.')
+                QMessageBox.information(self, "Thông báo", f"Profile {profile_name} đang mở Chrome.")
             else:
                 current_profile = os.path.basename(self.view_chrome_path or "")
                 QMessageBox.information(
                     self,
-                    'Thông báo',
-                    f'Một profile Chrome khác đang mở ({current_profile}). Hãy đóng cửa sổ đó trước.',
+                    "Thông báo",
+                    f"Một profile Chrome khác đang mở ({current_profile}). Hãy đóng cửa sổ đó trước.",
                 )
             return
 
-        dialog = ManualLoginChromeDialog(profile_name, profile_path, self)
-        self.view_chrome_path = profile_path
-        self.append_log(f"Đã mở Chrome đăng nhập cho profile: {profile_name}")
-
-        if dialog.exec_() != QDialog.Accepted:
-            self.view_chrome = None
-            self.view_chrome_path = None
-            self.append_log(f"Chưa xác nhận đăng nhập profile: {profile_name}")
-            return
-
-        self.view_chrome = None
-        self.view_chrome_path = None
-        saved_path = ensure_profile_directory(profile_path)
-        if AccountDB(None).mark_profile_logged_in(saved_path):
-            self.on_row_signal(selected_profile["row"], "Đã đăng nhập")
-            self.append_log(f"Đã lưu trạng thái đăng nhập cho profile: {profile_name}")
-            self._start_manual_login_refresh(selected_profile, saved_path, profile_name)
-            QMessageBox.information(
-                self,
-                "Thành công",
-                "Đã lưu profile đăng nhập vào database. Tool sẽ tự cập nhật số page ở nền.",
-            )
-            return
-
-        QMessageBox.warning(
-            self,
-            "Thông báo",
-            "Không tìm thấy profile trong database để cập nhật.",
+        self._launch_view_chrome(
+            selected_profile["row"], profile_path, profile_proxy, profile_cookie, profile_name
         )
+
+    def _launch_view_chrome(self, row, profile_path, proxy, cookie, profile_name):
+        # Chạy Chrome trên main thread (giống test.py chạy mượt), KHÔNG dùng
+        # QThread. Giữ cửa sổ sống bằng QTimer bơm pipe CDP mỗi 300ms thay vì
+        # vòng msleep: mỗi tick gọi 1 hàm Playwright nên pipe luôn được đọc ->
+        # thao tác (scroll/click) không nghẽn. QTimer không block Qt event loop
+        # nên GUI tool vẫn phản hồi.
+        try:
+            proxy_settings = build_playwright_proxy(proxy or "")
+        except Exception as exc:
+            QMessageBox.warning(self, "Lỗi", f"Proxy không hợp lệ: {exc}")
+            return
+
+        args = list(VIEW_CHROME_NETWORK_ARGS)
+        launch_options = {
+            "user_data_dir": profile_path,
+            "executable_path": CHROME_PATH,
+            "headless": False,
+            # Bỏ --enable-automation: xóa banner "Chrome is being controlled".
+            "ignore_default_args": ["--enable-automation"],
+            "args": args,
+        }
+        if proxy_settings:
+            launch_options["proxy"] = proxy_settings
+
+        try:
+            playwright = sync_playwright().start()
+            context = playwright.chromium.launch_persistent_context(**launch_options)
+        except Exception as exc:
+            error_message = str(exc)
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+            if "user data directory is already in use" in error_message.lower():
+                QMessageBox.warning(
+                    self,
+                    "Thông báo",
+                    "Profile Chrome đang mở ở nơi khác. Hãy đóng Chrome của profile này trước.",
+                )
+            else:
+                QMessageBox.warning(self, "Lỗi", f"Lỗi mở Chrome: {error_message}")
+            return
+
+        self.view_chrome_playwright = playwright
+        self.view_chrome_context = context
+        self.view_chrome_row = row
+        self.view_chrome_path = profile_path
+        self._view_chrome_closed_flag = False
+
+        # Bấm X đóng cửa sổ -> context "close" -> đánh dấu để teardown ở tick sau.
+        context.on("close", lambda _: setattr(self, "_view_chrome_closed_flag", True))
+
+        pages = [
+            page
+            for page in context.pages
+            if not (page.url or "").startswith("chrome-extension://")
+        ]
+        page = pages[0] if pages else context.new_page()
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(60000)
+        self.view_chrome_page = page
+
+        if proxy_settings:
+            self.on_row_signal(row, f"Đang mở Chrome (proxy: {mask_proxy(proxy)})")
+
+        try:
+            page.goto(VIEW_CHROME_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            logger.warning("Không mở được Facebook trong Chrome: %s", exc)
+
+        self._sync_view_chrome_cookie(page, context, cookie)
+
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+
+        self.view_chrome_timer = QTimer(self)
+        self.view_chrome_timer.setInterval(300)
+        self.view_chrome_timer.timeout.connect(self._pump_view_chrome)
+        self.view_chrome_timer.start()
+
+        self.on_row_signal(row, "Đang mở Chrome")
+        self.append_log(f"Đang mở Chrome cho profile: {profile_name}")
+
+    def _pump_view_chrome(self):
+        # Tick QTimer: gọi 1 hàm Playwright để drain pipe CDP. Nếu cửa sổ đã đóng
+        # (X hoặc context chết) thì teardown.
+        if self._view_chrome_closed_flag or not self.view_chrome_context:
+            self._teardown_view_chrome()
+            return
+        try:
+            if not self.view_chrome_context.pages:
+                self._teardown_view_chrome()
+                return
+            self.view_chrome_page.wait_for_timeout(50)
+        except Exception:
+            self._teardown_view_chrome()
+
+    def _sync_view_chrome_cookie(self, page, context, cookie):
+        # Chỉ add cookie khi profile chưa đăng nhập đúng nick: so c_user/xs của
+        # cookie trình duyệt với cookie tài khoản; trùng thì bỏ qua, lệch thì add.
+        account_cookie = parse_cookie_header(cookie or "")
+        account_login = {
+            name: account_cookie[name]
+            for name in ("c_user", "xs")
+            if account_cookie.get(name)
+        }
+        if not account_login:
+            return
+
+        try:
+            browser_cookies = context.cookies(["https://www.facebook.com"])
+        except Exception:
+            browser_cookies = []
+        browser_login = {
+            str(c.get("name")): str(c.get("value"))
+            for c in browser_cookies
+            if c.get("name") in ("c_user", "xs")
+        }
+        if browser_login == account_login:
+            logger.info("Cookie trình duyệt đã trùng cookie tài khoản, bỏ qua add")
+            return
+
+        cookies = build_facebook_playwright_cookies(cookie)
+        if not cookies:
+            return
+        try:
+            context.add_cookies(cookies)
+            page.goto(VIEW_CHROME_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            logger.warning("Không nạp được cookie: %s", exc)
+
+    def _teardown_view_chrome(self):
+        row = self.view_chrome_row
+
+        if self.view_chrome_timer is not None:
+            try:
+                self.view_chrome_timer.stop()
+            except Exception:
+                pass
+        self.view_chrome_timer = None
+
+        if self.view_chrome_context is not None:
+            try:
+                self.view_chrome_context.close()
+            except Exception:
+                pass
+        self.view_chrome_context = None
+
+        if self.view_chrome_playwright is not None:
+            try:
+                self.view_chrome_playwright.stop()
+            except Exception:
+                pass
+        self.view_chrome_playwright = None
+
+        self.view_chrome_page = None
+        self.view_chrome_row = None
+        self.view_chrome_path = None
+        self._view_chrome_closed_flag = False
+
+        if row is not None:
+            self.on_row_signal(row, "Đã đóng Chrome")
 
     def build_data(self, max_active_accounts: int | None = None):
         tasks = []
@@ -1443,9 +1644,6 @@ class MainWindow(QMainWindow):
         if self.group_file_path:
             try:
                 with open(self.group_file_path, "r", encoding="utf-8") as file:
-                    groups_list = [line.strip() for line in file if line.strip()]
-            except UnicodeDecodeError:
-                with open(self.group_file_path, "r", encoding="utf-8-sig", errors="ignore") as file:
                     groups_list = [line.strip() for line in file if line.strip()]
             except Exception:
                 groups_list = None
@@ -1460,7 +1658,7 @@ class MainWindow(QMainWindow):
                 prompt_cmt = self.read_text_file(str(default_comment_path))
 
         if not groups_list:
-            QMessageBox.warning(self, "Error", "Khong doc duoc danh sach group hoac file group dang rong.")
+            QMessageBox.warning(self, "Lỗi", "Không đọc được danh sách group hoặc file group đang rỗng.")
             return []
 
         selected_profiles = []
@@ -1475,7 +1673,7 @@ class MainWindow(QMainWindow):
             selected_profiles.append((row, profile_item.text()))
 
         if not selected_profiles:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để chạy tool.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để chạy tool.')
             return []
 
         if max_active_accounts is not None:
@@ -1483,7 +1681,7 @@ class MainWindow(QMainWindow):
             if len(selected_profiles) > active_limit:
                 skipped_count = len(selected_profiles) - active_limit
                 self.append_log(
-                    f"Chi su dung {active_limit} nick dau tien theo so luong luong crawl; bo qua {skipped_count} nick dang chon."
+                    f"Chỉ sử dụng {active_limit} nick đầu tiên theo số lượng luồng crawl; bỏ qua {skipped_count} nick đang chọn."
                 )
                 selected_profiles = selected_profiles[:active_limit]
 
@@ -1492,30 +1690,14 @@ class MainWindow(QMainWindow):
 
         for profile_index, ((row, profile_name), assigned_groups) in enumerate(zip(selected_profiles, group_chunks), start=1):
             if not assigned_groups:
-                self.append_log(f"Dong {row + 1}: khong co group duoc chia, bo qua nick nay.")
+                self.append_log(f"Dòng {row + 1}: không có group được chia, bỏ qua nick này.")
                 continue
 
             self.append_log(
                 f"Chia group: nick {profile_index}/{len(selected_profiles)} dong {row + 1} nhan {len(assigned_groups)} group."
             )
 
-            account_name = db.find_account_name_from_path_chrome(profile_name)
-            path_profile = db.find_full_path_from_path_chrome(profile_name)
-            proxy = db.find_proxy_from_path_chrome(profile_name)
-            info_account = db.find_info_account_from_path_chrome(profile_name)
-            cookie = db.find_cookie_from_path_chrome(profile_name)
-            token = db.find_token_from_path_chrome(profile_name)
-            post_count = db.find_post_count_from_path_chrome(profile_name)
-
-            email, password, twofa = "", "", ""
-            if info_account:
-                info_parts = info_account.split("|", 2)
-                if len(info_parts) == 3:
-                    email, password, twofa = info_parts
-                elif len(info_parts) == 2:
-                    email, password = info_parts
-                elif len(info_parts) == 1:
-                    email = info_parts[0]
+            account = db.find_account_from_path_chrome(profile_name) or {}
 
             cycle_total_hours = float(self.cycle_total) if self.cycle_total is not None else 0.0
             if cycle_total_hours > 0 and assigned_groups:
@@ -1530,15 +1712,15 @@ class MainWindow(QMainWindow):
             tasks.append(
                 Info_data(
                     row=row,
-                    account_name=account_name or "",
-                    path_chrome=path_profile or "",
-                    proxy=proxy or "",
-                    email=email or "",
-                    password=password or "",
-                    twofa=twofa or "",
-                    cookie=cookie or "",
-                    token=token or "",
-                    post_count=str(post_count or ""),
+                    account_name=account.get("Account_Name") or "",
+                    path_chrome=account.get("Path_Chrome") or "",
+                    proxy=account.get("Proxy") or "",
+                    email=account.get("Email") or "",
+                    password=account.get("Password") or "",
+                    twofa=account.get("Twofa") or "",
+                    cookie=account.get("Cookie") or "",
+                    token=account.get("Token") or "",
+                    post_count=str(account.get("Post_Count") or ""),
                     api_key=self.api_key or "",
                     groups_list=assigned_groups,
                     prompt=prompt,
@@ -1553,7 +1735,7 @@ class MainWindow(QMainWindow):
             )
 
         if not tasks:
-            QMessageBox.warning(self, 'Error', 'Vui lòng tích chọn ít nhất 1 tài khoản để chạy tool.')
+            QMessageBox.warning(self, 'Lỗi', 'Vui lòng tích chọn ít nhất 1 tài khoản để chạy tool.')
             return []
 
         return tasks
