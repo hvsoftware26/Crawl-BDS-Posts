@@ -15,6 +15,7 @@ from services.post_service import (
     nomalize_post,
     rm_non_keywords_posts,
 )
+from services.group_scan_state_service import load_processed_post_ids, remember_processed_posts
 from utils.time_utils import HANOI_TIMEZONE, is_created_time_within_delay_window
 
 logger = getLogger(__name__)
@@ -40,8 +41,9 @@ class GroupService:
         status_callback=None,
         post_callback=None,
         stop_callback=None,
+        console_callback=None,
     ):
-        self.facebook_client = FacebookClient(session=None) 
+        self.facebook_client = FacebookClient(session=None)
         self.groups_list = groups_list
         self.delay_next_run = delay_next_run * 60
         self.recent_window_seconds = (
@@ -64,6 +66,7 @@ class GroupService:
         self.status_callback = status_callback or (lambda _message: None)
         self.post_callback = post_callback or (lambda _value: None)
         self.stop_callback = stop_callback or (lambda: False)
+        self.console_callback = console_callback or (lambda _message: None)
         logger.debug(
             "Initialized GroupService: groups=%s delay_seconds=%s recent_window_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
             len(groups_list or []),
@@ -75,6 +78,18 @@ class GroupService:
             bool(proxies),
             bool(API_KEY),
         )
+
+    @staticmethod
+    def _shorten_comment_id(comment_id) -> str:
+        # comment_id dạng ownerid_postid_commentid. Bỏ ownerid, giữ postid,
+        # cắt commentid còn 12 ký tự cho gọn trên console log.
+        raw = str(comment_id or "").strip()
+        if not raw:
+            return "?"
+        parts = raw.split("_")
+        if len(parts) >= 3:
+            return f"{parts[-2]}_{parts[-1][:12]}"
+        return raw
 
     def _is_fixed_comment_enabled(self) -> bool:
         return (
@@ -102,7 +117,6 @@ class GroupService:
                 prompt=self.prompt_cmt,
                 api_key=self.API_KEY,
                 model="gpt-5-mini",
-                proxies=self.proxies,
             )
             return comment_message, "ai"
 
@@ -209,6 +223,13 @@ class GroupService:
                         result.get("comment_id") or "?",
                     )
                 )
+                self.console_callback(
+                    "Đã comment page %s | comment_id: %s"
+                    % (
+                        result.get("page_name") or "",
+                        self._shorten_comment_id(result.get("comment_id")),
+                    )
+                )
             except Exception as e:
                 post["comment_status"] = 0
                 post["comment_error"] = str(e)
@@ -244,6 +265,30 @@ class GroupService:
             reference_time.isoformat(),
         )
         return recent_posts
+
+    def _filter_unprocessed_posts(self, posts: list[dict], processed_post_ids: set[str]):
+        if not processed_post_ids:
+            return posts or [], 0
+
+        filtered_posts = []
+        skipped_count = 0
+        for post in posts or []:
+            post_id = str((post or {}).get("id") or "").strip()
+            if post_id and post_id in processed_post_ids:
+                skipped_count += 1
+                continue
+            filtered_posts.append(post)
+
+        if skipped_count:
+            logger.info(
+                "Skipped processed posts before filtering/commenting: skipped=%s remaining=%s",
+                skipped_count,
+                len(filtered_posts),
+            )
+            self.status_callback(
+                f"Bỏ qua {skipped_count} bài đã xử lý trước đó"
+            )
+        return filtered_posts, skipped_count
 
     def _has_posts_older_than_window(self, posts: list[dict], reference_time: datetime):
         has_older_posts = any(
@@ -291,9 +336,12 @@ class GroupService:
         )
         return added_count
 
-    def _collect_recent_posts(self, group_id: str):
+    def _collect_recent_posts(self, group_id: str, processed_post_ids: set[str] | None = None):
         all_recent_posts = []
         seen_post_ids = set()
+        processed_post_ids = set(processed_post_ids or set())
+        skipped_processed_count = 0
+        stopped_by_processed_post = False
         page_number = 1
         consecutive_pages_without_new_posts = 0
         reference_time = datetime.now(HANOI_TIMEZONE)
@@ -316,13 +364,21 @@ class GroupService:
         )
         if not response or response.get("stopped"):
             return
+        resolved_group_id = response.get("id") or group_id
+        if resolved_group_id and resolved_group_id != group_id:
+            processed_post_ids.update(load_processed_post_ids(resolved_group_id))
 
         while True:
             page_posts = nomalize_post(response.get("posts", []),self.max_length_text, stop_callback=self.stop_callback)
             recent_posts = self._filter_recent_posts(page_posts, reference_time)
+            unprocessed_recent_posts, page_skipped_processed = self._filter_unprocessed_posts(
+                recent_posts,
+                processed_post_ids,
+            )
+            skipped_processed_count += page_skipped_processed
             added_recent_posts = self._extend_unique_posts(
                 all_recent_posts,
-                recent_posts,
+                unprocessed_recent_posts,
                 seen_post_ids,
             )
             if added_recent_posts == 0:
@@ -331,11 +387,12 @@ class GroupService:
                 consecutive_pages_without_new_posts = 0
 
             logger.info(
-                "Collected page for group_id=%s page=%s normalized_posts=%s recent_posts=%s added_recent_posts=%s total_unique_recent_posts=%s consecutive_pages_without_new_posts=%s",
+                "Collected page for group_id=%s page=%s normalized_posts=%s recent_posts=%s skipped_processed_posts=%s added_recent_posts=%s total_unique_recent_posts=%s consecutive_pages_without_new_posts=%s",
                 group_id,
                 page_number,
                 len(page_posts),
                 len(recent_posts),
+                page_skipped_processed,
                 added_recent_posts,
                 len(all_recent_posts),
                 consecutive_pages_without_new_posts,
@@ -343,6 +400,19 @@ class GroupService:
             self.status_callback(f"Đã thu thập {len(all_recent_posts)} bài viết gần đây")
             if not self.sleep_with_stop(1):
                 return
+
+            if page_skipped_processed:
+                stopped_by_processed_post = True
+                logger.info(
+                    "Stop paging group_id=%s at page=%s because processed posts were reached: skipped_processed=%s",
+                    group_id,
+                    page_number,
+                    page_skipped_processed,
+                )
+                self.status_callback("Gặp bài đã xử lý trước đó, dừng thu thập sớm")
+                if not self.sleep_with_stop(1):
+                    return
+                break
 
             if consecutive_pages_without_new_posts >= 3:
                 logger.info(
@@ -389,8 +459,11 @@ class GroupService:
             return
         return {
             "group_id": group_id,
+            "state_group_id": resolved_group_id,
             "total_posts": len(all_recent_posts),
             "posts": all_recent_posts,
+            "skipped_processed_count": skipped_processed_count,
+            "stopped_by_processed_post": stopped_by_processed_post,
         }
 
     def _filter_posts_for_output(self, posts: list[dict]):
@@ -432,7 +505,6 @@ class GroupService:
             prompt=self.prompt,
             api_key=self.API_KEY,
             model="gpt-5-mini",
-            proxies=self.proxies,
             stop_callback=self.stop_callback,
         )
         logger.info(
@@ -470,7 +542,11 @@ class GroupService:
             self.progress_callback(f"{index + 1}/{len(self.groups_list)}")
 
             try:
-                res_posts = self._collect_recent_posts(group_id)
+                processed_post_ids = load_processed_post_ids(group_id)
+                res_posts = self._collect_recent_posts(
+                    group_id,
+                    processed_post_ids=processed_post_ids,
+                )
                 if not res_posts:
                     logger.warning(
                         "No posts collected for group_id=%s, skipping to next group",
@@ -494,6 +570,18 @@ class GroupService:
                 if not self.sleep_with_stop(1):
                     return
                 full_posts = res_posts.get("posts", [])
+                state_group_id = res_posts.get("state_group_id") or group_id
+                processed_post_ids = load_processed_post_ids(group_id, aliases=[state_group_id])
+                full_posts, skipped_before_filter = self._filter_unprocessed_posts(
+                    full_posts,
+                    processed_post_ids,
+                )
+                if skipped_before_filter:
+                    logger.info(
+                        "Removed processed posts before keyword/AI/comment: group_id=%s skipped=%s",
+                        group_id,
+                        skipped_before_filter,
+                    )
                 filtered_posts = self._filter_posts_for_output(full_posts)
 
                 posts_status = build_posts_status(
@@ -504,6 +592,11 @@ class GroupService:
                     stop_callback = self.stop_callback,
                 )
                 posts_status = self._comment_valid_posts(posts_status)
+                remember_processed_posts(
+                    group_id,
+                    posts_status,
+                    aliases=[state_group_id],
+                )
 
                 logger.info(
                     "Prepared %s posts for JSON output from group %s",

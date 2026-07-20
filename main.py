@@ -1,5 +1,5 @@
 ﻿# Main GUI
-import sys, os, json, re, shutil
+import sys, os, json, shutil
 from logging import getLogger
 from pathlib import Path
 from typing import List
@@ -15,9 +15,9 @@ from controllers.scan_controller import reset_posts_json
 from resources.ui.gui import MultiProfileDialog, Ui_MainWindow, create_application
 from services.ai_service import OpenAIService
 from models.account import Info_data
+from workers.account_import_worker import AccountImportWorker
 from workers.process_worker import Worker_Handle
-from integrations.facebook_client import get_account_profile_info, get_managed_page_names
-from utils.account_import import parse_account_import_line
+from integrations.facebook_client import get_managed_page_names
 from utils.facebook_cookies import (
     build_facebook_playwright_cookies,
     parse_cookie_header,
@@ -26,7 +26,6 @@ from utils.group_distribution import split_groups_for_accounts
 from utils.proxy_utils import (
     build_playwright_proxy,
     build_requests_proxies,
-    check_proxy_status,
     mask_proxy,
     parse_proxy,
     verify_browser_proxy_ip,
@@ -35,7 +34,6 @@ from utils.security import mask_secret
 from app_config import (
     APP_BASE_DIR,
     CHROME_PATH,
-    build_local_profile_path,
 )
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 UID_CHECK_DEFAULT_THREADS = 8
@@ -66,15 +64,6 @@ def ensure_profile_directory(path_chrome: str) -> str:
     profile_path = Path(path_chrome).resolve()
     profile_path.mkdir(parents=True, exist_ok=True)
     return str(profile_path)
-
-
-def proxy_requires_auth(proxy_value: str | None) -> bool:
-    config = parse_proxy(proxy_value)
-    return bool(config and config.has_auth)
-
-
-def imported_cookie_status(proxy_value: str | None) -> str:
-    return "Chưa xác thực proxy" if proxy_requires_auth(proxy_value) else "Đã đăng nhập"
 
 
 class ProxyUpdateDialog(QDialog):
@@ -116,151 +105,52 @@ class ProxyUpdateDialog(QDialog):
         return self.proxy_input.text().strip()
 
 
-class ManualLoginChromeSession:
-    def __init__(self, profile_name: str, profile_path: str, proxy: str = ""):
-        self.profile_name = profile_name
-        self.profile_path = profile_path
-        self.proxy = proxy or ""
-        self.playwright = None
-        self.context = None
-        self.page = None
+class CookieTokenUpdateDialog(QDialog):
+    def __init__(self, current_token: str = "", current_cookie: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Cập nhật token/cookie")
+        self.setModal(True)
+        self.setMinimumWidth(480)
 
-    def start(self) -> dict:
-        try:
-            proxy_settings = build_playwright_proxy(self.proxy)
-        except Exception as exc:
-            raise RuntimeError(f"Proxy không hợp lệ: {exc}") from exc
+        layout = QVBoxLayout(self)
 
-        masked_proxy = mask_proxy(self.proxy)
+        token_label = QLabel("Token mới")
+        self.token_input = QLineEdit()
+        self.token_input.setPlaceholderText("EAAG...")
+        self.token_input.setText(str(current_token or ""))
 
-        launch_options = self._build_launch_options(proxy_settings)
-        self.playwright = sync_playwright().start()
-        try:
-            self.context = self.playwright.chromium.launch_persistent_context(**launch_options)
-            self.page = self._main_page()
-            self.page.set_default_timeout(30000)
-            self.page.set_default_navigation_timeout(60000)
+        cookie_label = QLabel("Cookie mới")
+        self.cookie_input = QLineEdit()
+        self.cookie_input.setPlaceholderText("c_user=...; xs=...; ...")
+        self.cookie_input.setText(str(current_cookie or ""))
 
-            messages = []
-            if masked_proxy:
-                messages.append(f"Đang dùng proxy Playwright: {masked_proxy}")
-                messages.extend(self._verify_playwright_proxy())
+        layout.addWidget(token_label)
+        layout.addWidget(self.token_input)
+        layout.addWidget(cookie_label)
+        layout.addWidget(self.cookie_input)
 
-            self._open_facebook()
-            messages.append("Đã mở Facebook trong Chrome.")
-            return {
-                "messages": "\n".join(messages),
-            }
-        except Exception:
-            self.close()
-            raise
-
-    def _build_launch_options(self, proxy_settings) -> dict:
-        args = [
-            "--window-size=1100,760",
-            "--lang=vi-VN",
-            "--accept-lang=vi-VN,vi",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-features=CalculateNativeWinOcclusion,Translate,AutofillServerCommunication,MediaRouter,DisableLoadExtensionCommandLineSwitch,UseDnsHttpsSvcb,EncryptedClientHello",
-            "--disable-background-timer-throttling",
-            "--disable-renderer-backgrounding",
-            "--disable-spell-checking",
-            "--disable-sync",
-            "--disable-quic",
-            "--dns-prefetch-disable",
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--disable-extensions",
-        ]
-
-        launch_options = {
-            "user_data_dir": self.profile_path,
-            "executable_path": CHROME_PATH,
-            "headless": False,
-            "args": args,
-        }
-        if proxy_settings:
-            launch_options["proxy"] = proxy_settings
-
-        return launch_options
-
-    def _main_page(self):
-        pages = [
-            page
-            for page in self.context.pages
-            if not (page.url or "").startswith("chrome-extension://")
-        ]
-        return pages[0] if pages else self.context.new_page()
-
-    def _verify_playwright_proxy(self) -> list[str]:
-        ip_result = verify_browser_proxy_ip(
-            self.page,
-            self.proxy,
-            timeout_ms=10000,
-            attempts=2,
-            delay_seconds=0.5,
+        button_row = QHBoxLayout()
+        self.cancel_btn = QPushButton("Hủy")
+        self.cancel_btn.setStyleSheet(
+            "QPushButton { background:#16a34a; color:white; font-weight:600; padding:7px 16px; border-radius:6px; }"
+            "QPushButton:hover { background:#15803d; }"
         )
-        origin = ip_result.get("origin", "")
-        if not ip_result.get("ok"):
-            source = ip_result.get("source_url") or "unknown"
-            error = ip_result.get("error") or "không đọc được IP"
-            if origin:
-                raise RuntimeError(f"Proxy Playwright chưa đúng IP. IP nhận được: {origin} (nguồn: {source})")
-            raise RuntimeError(f"Không kiểm tra được IP proxy Playwright: {error} (nguồn: {source})")
+        self.confirm_btn = QPushButton("Xác nhận")
+        self.confirm_btn.setStyleSheet(
+            "QPushButton { background:#dc2626; color:white; font-weight:600; padding:7px 16px; border-radius:6px; }"
+            "QPushButton:hover { background:#b91c1c; }"
+        )
+        self.cancel_btn.clicked.connect(self.reject)
+        self.confirm_btn.clicked.connect(self.accept)
+        button_row.addWidget(self.cancel_btn)
+        button_row.addWidget(self.confirm_btn)
+        layout.addLayout(button_row)
 
-        match_note = ""
-        if ip_result.get("matches_expected") is True:
-            match_note = " đúng IP proxy"
-        elif ip_result.get("matches_expected") is None:
-            match_note = " đã nhận IP"
-        return [
-            "Đang kiểm tra IP qua proxy Playwright...",
-            f"Proxy Playwright OK{match_note}: {origin}",
-        ]
+    def token_value(self) -> str:
+        return self.token_input.text().strip()
 
-    def _open_facebook(self):
-        if not self.page:
-            return
-
-        last_url = MANUAL_FACEBOOK_LOGIN_URLS[-1]
-        for url in MANUAL_FACEBOOK_LOGIN_URLS:
-            last_url = url
-            try:
-                self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
-                break
-            except Exception:
-                continue
-        else:
-            try:
-                self.page.evaluate("url => window.location.href = url", last_url)
-            except Exception:
-                pass
-
-        try:
-            self.page.bring_to_front()
-        except Exception:
-            pass
-
-    def close(self):
-        try:
-            if self.context:
-                self.context.close()
-        except Exception:
-            pass
-        finally:
-            self.context = None
-            self.page = None
-
-        try:
-            if self.playwright:
-                self.playwright.stop()
-        except Exception:
-            pass
-        finally:
-            self.playwright = None
+    def cookie_value(self) -> str:
+        return self.cookie_input.text().strip()
 
 
 class MainWindow(QMainWindow):
@@ -293,6 +183,7 @@ class MainWindow(QMainWindow):
         self.view_chrome_row = None
         self.view_chrome_path = None
         self._view_chrome_closed_flag = False
+        self.account_import_worker = None
         self.is_running = False
 
         self._connect_signals()
@@ -492,21 +383,6 @@ class MainWindow(QMainWindow):
         item.setTextAlignment(Qt.AlignCenter)
         self.uic.table.setItem(row, 6, item)
 
-    @staticmethod
-    def _split_page_names(page_names: str) -> list[str]:
-        names = []
-        seen = set()
-        for name in str(page_names or "").replace("|", "\n").splitlines():
-            normalized_name = " ".join(name.split()).strip()
-            if not normalized_name:
-                continue
-            key = normalized_name.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            names.append(normalized_name)
-        return names
-
     def _format_page_cell_text(self, page_count: int | str, page_names: str = "") -> str:
         try:
             count_value = int(page_count or 0)
@@ -546,6 +422,7 @@ class MainWindow(QMainWindow):
         worker.page_names_signal.connect(self.on_page_names_signal)
         worker.post_signal.connect(self.on_post_signal)
         worker.finished_signal.connect(self.on_task_finished)
+        worker.console_signal.connect(self.append_log)
         worker.finished.connect(self._cleanup_finished_workers)
         return worker
 
@@ -723,118 +600,17 @@ class MainWindow(QMainWindow):
                     data.get('Status', ''),
                     data.get('Post_Count', ''),
                 )
-
-            self.uic.table.setUpdatesEnabled(True)
         except Exception:
             pass
+        finally:
+            self.uic.table.setUpdatesEnabled(True)
 
     
-    def _parse_profile_line(self, line: str, normal_mode: bool = True):
-        parsed_profile = parse_account_import_line(line)
-        parsed_profile["path_chrome"] = ensure_profile_directory(
-            str(build_local_profile_path(parsed_profile["uid"]))
-        )
-        return parsed_profile
-
-    def _seed_profile_with_facebook_cookie(self, profile_path: str, cookie: str, proxy: str = "") -> bool:
-        cookies = build_facebook_playwright_cookies(cookie)
-        if not cookies:
-            return False
-
-        # LUỒNG 1 Bước 3: mở Chrome headless KÈM PROXY (kỹ thuật giống test.py:
-        # truyền proxy dict vào launch_persistent_context, KHÔNG dùng --no-proxy-server
-        # và KHÔNG bật context.route interception -> proxy auth hoạt động).
-        proxy_settings = build_playwright_proxy(proxy)
-
-        args = [
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-sync",
-            "--window-position=-32000,-32000",
-            "--window-size=1,1",
-            "--disable-gpu",
-            "--disable-software-rasterizer",
-        ]
-        launch_options = {
-            "user_data_dir": profile_path,
-            "executable_path": CHROME_PATH,
-            "headless": True,
-            "args": args,
-        }
-        if proxy_settings:
-            launch_options["proxy"] = proxy_settings
-
-        playwright = sync_playwright().start()
-        context = None
-        try:
-            context = playwright.chromium.launch_persistent_context(**launch_options)
-            context.clear_cookies(domain=re.compile(r"(^|\.)facebook\.com$"))
-            context.add_cookies(cookies)
-
-            stored_cookie_names = {
-                item.get("name")
-                for item in context.cookies([
-                    "https://facebook.com",
-                    "https://www.facebook.com",
-                    "https://m.facebook.com",
-                ])
-            }
-            if not {"c_user", "xs"}.issubset(stored_cookie_names):
-                return False
-
-            # Mở Facebook để trình duyệt nhận session đăng nhập từ cookie.
-            pages = [
-                page
-                for page in context.pages
-                if not (page.url or "").startswith("chrome-extension://")
-            ]
-            page = pages[0] if pages else context.new_page()
-            try:
-                page.goto(
-                    "https://www.facebook.com/?locale=vi_VN",
-                    wait_until="domcontentloaded",
-                    timeout=60000,
-                )
-            except Exception as exc:
-                self.append_log(f"Đã gắn cookie nhưng chưa mở được Facebook qua proxy: {exc}")
-            return True
-        finally:
-            try:
-                if context:
-                    context.close()
-            finally:
-                playwright.stop()
-
-    def _update_imported_account_graph_info(self, parsed_profile: dict) -> dict:
-        proxies = build_requests_proxies(parsed_profile.get("proxy", ""))
-        profile_info = get_account_profile_info(
-            parsed_profile["token"],
-            account_cookies=parsed_profile["cookie"],
-            proxies=proxies,
-        )
-        account_name = profile_info.get("name") or parsed_profile["uid"]
-        page_names = get_managed_page_names(
-            parsed_profile["token"],
-            account_cookies=parsed_profile["cookie"],
-            account_name=account_name,
-            proxies=proxies,
-        )
-
-        db = AccountDB(None)
-        db.update_account_name_by_path(parsed_profile["path_chrome"], account_name)
-        db.update_page_info_by_path(
-            parsed_profile["path_chrome"],
-            len(page_names),
-            "\n".join(page_names),
-        )
-        return {
-            "account_name": account_name,
-            "page_count": len(page_names),
-            "page_names": page_names,
-        }
-
     def open_profile_dialog(self):
+        if self._is_account_import_running():
+            QMessageBox.information(self, "Thông báo", "Đang import tài khoản. Vui lòng đợi tiến trình hiện tại kết thúc.")
+            return
+
         dialog = MultiProfileDialog(self)
         if dialog.exec_() != QDialog.Accepted:
             return
@@ -844,98 +620,38 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cảnh báo", "Chưa có dữ liệu tài khoản.")
             return
 
-        mode_label = "Cookie/Token"
-        db = AccountDB(None)
-        created_count = 0
-        updated_count = 0
-        seeded_count = 0
-        page_updated_count = 0
+        self._start_account_import_worker(raw_lines)
 
-        for line_number, line in enumerate(raw_lines, start=1):
-            try:
-                parsed_profile = self._parse_profile_line(line)
-                action = db.save_imported_cookie_account(
-                    uid=parsed_profile["uid"],
-                    password=parsed_profile["password"],
-                    cookie=parsed_profile["cookie"],
-                    token=parsed_profile["token"],
-                    email=parsed_profile["email"],
-                    mail_password=parsed_profile["mail_password"],
-                    twofa=parsed_profile["twofa"],
-                    path_chrome=parsed_profile["path_chrome"],
-                    proxy=parsed_profile["proxy"],
-                )
-            except Exception as exc:
-                QMessageBox.warning(
-                    self,
-                    "Cảnh báo",
-                    f"Dòng {line_number} không hợp lệ:\n{exc}",
-                )
-                return
+    def _is_account_import_running(self) -> bool:
+        return bool(self.account_import_worker and self.account_import_worker.isRunning())
 
-            if action == "created":
-                created_count += 1
-            else:
-                updated_count += 1
+    def _start_account_import_worker(self, raw_lines: list[str]):
+        worker = AccountImportWorker(raw_lines)
+        self.account_import_worker = worker
+        self.uic.profile_btn.setEnabled(False)
+        self.uic.profile_info.setText(f"Đang import {len(raw_lines)} tài khoản...")
+        self.append_log(f"Bắt đầu import {len(raw_lines)} tài khoản trong luồng nền.")
 
-            path_chrome = parsed_profile["path_chrome"]
+        worker.log_signal.connect(self.append_log)
+        worker.progress_signal.connect(self.uic.profile_info.setText)
+        worker.error_signal.connect(self._on_account_import_error)
+        worker.finished_signal.connect(self._on_account_import_finished)
+        worker.finished.connect(self._on_account_import_thread_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
-            # LUỒNG 1 - Bước 1: Check Proxy (IPv4/IPv6). Fail -> dừng dòng này.
-            if parsed_profile.get("proxy"):
-                proxy_result = check_proxy_status(parsed_profile["proxy"])
-                if not proxy_result.get("ok"):
-                    db.update_status_by_path(path_chrome, "Proxy hết hạn / lỗi")
-                    self.append_log(
-                        f"Dòng {line_number}: {proxy_result.get('message') or 'Proxy hết hạn / lỗi'}"
-                    )
-                    continue
+    def _on_account_import_error(self, message: str):
+        QMessageBox.warning(self, "Cảnh báo", str(message or "Không import được tài khoản."))
 
-            # LUỒNG 1 - Bước 2: Check Account bằng cookie+token qua Graph API.
-            # Fail -> Status "Tài khoản không hoạt động", dừng dòng này.
-            try:
-                graph_info = self._update_imported_account_graph_info(parsed_profile)
-                page_updated_count += 1
-                page_names_text = ", ".join(graph_info.get("page_names") or [])
-                if page_names_text:
-                    page_names_text = f" | Page: {page_names_text}"
-                self.append_log(
-                    f"Dòng {line_number}: đã cập nhật {graph_info.get('page_count') or 0} page "
-                    f"cho {graph_info.get('account_name') or parsed_profile['uid']}"
-                    f"{page_names_text}"
-                )
-            except Exception as exc:
-                db.update_status_by_path(path_chrome, "Tài khoản không hoạt động")
-                self.append_log(f"Dòng {line_number}: tài khoản không hoạt động: {exc}")
-                continue
-
-            # LUỒNG 1 - Bước 3: Mở Chrome headless KÈM PROXY (kỹ thuật test.py),
-            # gắn cookie, mở Facebook để nhận session đăng nhập.
-            try:
-                if self._seed_profile_with_facebook_cookie(
-                    path_chrome,
-                    parsed_profile["cookie"],
-                    parsed_profile.get("proxy", ""),
-                ):
-                    seeded_count += 1
-                    db.update_status_by_path(path_chrome, "Đã đăng nhập")
-                else:
-                    db.update_status_by_path(path_chrome, "Đã nhập cookie")
-                    self.append_log(
-                        f"Dòng {line_number}: chưa xác nhận được session sau khi gắn cookie."
-                    )
-            except Exception as exc:
-                db.update_status_by_path(path_chrome, "Đã nhập cookie")
-                self.append_log(f"Dòng {line_number}: chưa nạp được cookie vào profile Chrome: {exc}")
-
+    def _on_account_import_finished(self, summary: dict):
         self.load_table()
-
-        summary_text = (
-            f"Đã lưu {len(raw_lines)} tài khoản | Chế độ: {mode_label}"
-            f" | Tạo mới: {created_count} | Cập nhật: {updated_count}"
-            f" | Nạp cookie profile: {seeded_count} | Cập nhật page: {page_updated_count}"
-        )
+        summary_text = str((summary or {}).get("summary_text") or "Đã kết thúc import tài khoản.")
         self.uic.profile_info.setText(summary_text)
         self.append_log(summary_text)
+
+    def _on_account_import_thread_finished(self):
+        self.uic.profile_btn.setEnabled(True)
+        self.account_import_worker = None
 
     def import_group_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1212,13 +928,16 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         copy_path_ = menu.addAction("📋 Copy đường dẫn profile")
         copy_proxy = menu.addAction("🌍 Copy proxy (tài nguyên)")
-        update_proxy = menu.addAction("♻️ Cập nhật proxy")
         copy_info_account = menu.addAction("📧 Copy mail|pass|pass_mail")
         copy_token = menu.addAction("🔑 Copy token (tài nguyên)")
         copy_cookie = menu.addAction("🍪 Copy cookie (tài nguyên)")
-        open_chrome = menu.addAction("🌐 Mở Chrome / Đăng nhập")
+        update_proxy = menu.addAction("♻️ Cập nhật proxy")
+        update_cookie_token = menu.addAction("🔑 Cập nhật token/cookie")
+        view_chrome = menu.addAction("🌐 Xem Chrome")
+        login_chrome = menu.addAction("🔓 Đăng nhập (gắn cookie)")
         menu.addSeparator()
         refresh_pages = menu.addAction("👥 Cập nhật page mới")
+        update_page_count = menu.addAction("🔢 Cập nhật số page (me/accounts)")
         check_uid_status = menu.addAction("✅ Kiểm tra UID sống/chết")
 
         selected_action = menu.exec(self.uic.table.viewport().mapToGlobal(pos))
@@ -1228,6 +947,12 @@ class MainWindow(QMainWindow):
         if selected_action == refresh_pages:
             if self._require_checked_profiles(allow_multiple=True):
                 self.refresh_pages_selected_accounts()
+            return
+
+        if selected_action == update_page_count:
+            profiles = self._require_checked_profiles(allow_multiple=True)
+            if profiles:
+                self.update_page_count_selected_accounts(profiles)
             return
 
         if selected_action == check_uid_status:
@@ -1246,6 +971,8 @@ class MainWindow(QMainWindow):
 
         if selected_action == copy_path_:
             self.copy_path()
+        elif selected_action == update_cookie_token:
+            self.update_cookie_token_selected_account()
         elif selected_action == copy_proxy:
             self.copy_proxy()
         elif selected_action == copy_info_account:
@@ -1254,8 +981,10 @@ class MainWindow(QMainWindow):
             self.copy_token()
         elif selected_action == copy_cookie:
             self.copy_cookie()
-        elif selected_action == open_chrome:
-            self.open_chrome()
+        elif selected_action == view_chrome:
+            self.view_chrome_profile()
+        elif selected_action == login_chrome:
+            self.login_chrome_profile()
 
     def _start_account_action(self, profiles: list[dict], action_mode: str, label: str, max_threads: int):
         if self.is_running:
@@ -1319,6 +1048,62 @@ class MainWindow(QMainWindow):
             max_threads=configured_threads,
         )
 
+    def update_page_count_selected_accounts(self, profiles: list[dict]):
+        # Bản đồng bộ chạy ngay trên main thread (không qua worker): với mỗi
+        # profile, gọi /me/accounts bằng token+cookie của nick (qua proxy nếu
+        # có) để đếm số page, rồi ghi DB + cập nhật cell. Nick chính đã bị loại
+        # khỏi danh sách page trong get_managed_page_names.
+        if not profiles:
+            return
+
+        db = AccountDB(None)
+        updated_count = 0
+        failed_profiles = []
+
+        for profile in profiles:
+            profile_name = profile["profile_name"]
+            account = db.find_account_from_path_chrome(profile_name) or {}
+            token = account.get("Token") or ""
+            cookie = account.get("Cookie") or ""
+            proxy = account.get("Proxy") or ""
+            account_name = account.get("Account_Name") or ""
+
+            if not token:
+                failed_profiles.append(f"{profile_name} (thiếu token)")
+                continue
+
+            try:
+                page_names = get_managed_page_names(
+                    token,
+                    account_cookies=cookie,
+                    account_name=account_name,
+                    proxies=build_requests_proxies(proxy),
+                )
+            except Exception as exc:
+                failed_profiles.append(f"{profile_name} ({exc})")
+                self.append_log(f"Không lấy được page cho {profile_name}: {exc}")
+                continue
+
+            page_count = len(page_names)
+            db.update_page_info_by_path(
+                profile["full_path"],
+                page_count,
+                "\n".join(page_names),
+            )
+            self.on_page_signal(profile["row"], page_count)
+            self.on_page_names_signal(profile["row"], "\n".join(page_names))
+            updated_count += 1
+            self.append_log(f"Đã cập nhật {page_count} page cho {profile_name}.")
+
+        if failed_profiles:
+            QMessageBox.warning(
+                self,
+                "Thông báo",
+                "Không cập nhật được số page cho:\n" + "\n".join(failed_profiles),
+            )
+
+        self.append_log(f"Đã cập nhật số page cho {updated_count}/{len(profiles)} tài khoản.")
+
     def update_proxy_selected_accounts(self, profiles: list[dict]):
         if not profiles:
             return
@@ -1367,6 +1152,48 @@ class MainWindow(QMainWindow):
             )
 
         self.append_log(f"Đã cập nhật proxy cho {updated_count} tài khoản.")
+
+    def update_cookie_token_selected_account(self):
+        profiles = self._require_checked_profiles(allow_multiple=False)
+        if not profiles:
+            return
+
+        profile = profiles[0]
+        db = AccountDB(None)
+        current_token = db.find_token_from_path_chrome(profile["profile_name"])
+        current_cookie = db.find_cookie_from_path_chrome(profile["profile_name"])
+
+        dialog = CookieTokenUpdateDialog(
+            current_token=current_token,
+            current_cookie=current_cookie,
+            parent=self,
+        )
+        if dialog.exec_() != QDialog.Accepted:
+            return
+
+        new_token = dialog.token_value()
+        new_cookie = dialog.cookie_value()
+
+        if not new_token:
+            QMessageBox.warning(self, "Thông báo", "Token mới không được để trống.")
+            return
+        if not new_cookie:
+            QMessageBox.warning(self, "Thông báo", "Cookie mới không được để trống.")
+            return
+
+        cookie_map = parse_cookie_header(new_cookie)
+        if not (cookie_map.get("c_user") and cookie_map.get("xs")):
+            QMessageBox.warning(self, "Thông báo", "Cookie phải có c_user và xs.")
+            return
+
+        if db.update_cookie_token_by_path(profile["full_path"], new_cookie, new_token):
+            self.append_log(f"Đã cập nhật token/cookie cho {profile['profile_name']}.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Thông báo",
+                f"Không cập nhật được token/cookie cho {profile['profile_name']}.",
+            )
 
     def copy_path(self):
         checked_paths = []
@@ -1428,7 +1255,15 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText('\n'.join(checked_paths))
         QMessageBox.information(self, 'Đã copy', f'Đã copy {len(checked_paths)} cookie.')
 
-    def open_chrome(self):
+    def view_chrome_profile(self):
+        # Xem Chrome: mở profile nhưng KHÔNG đụng cookie (giữ nguyên session sẵn có).
+        self._open_chrome(add_cookie=False)
+
+    def login_chrome_profile(self):
+        # Đăng nhập: mở profile và LUÔN gắn cookie tài khoản vào trình duyệt.
+        self._open_chrome(add_cookie=True)
+
+    def _open_chrome(self, add_cookie: bool):
         checked_profiles = self._collect_checked_profiles()
         if not checked_profiles:
             QMessageBox.warning(self, "Lỗi", "Vui lòng tích chọn ít nhất 1 tài khoản để mở Chrome.")
@@ -1466,10 +1301,15 @@ class MainWindow(QMainWindow):
             return
 
         self._launch_view_chrome(
-            selected_profile["row"], profile_path, profile_proxy, profile_cookie, profile_name
+            selected_profile["row"],
+            profile_path,
+            profile_proxy,
+            profile_cookie,
+            profile_name,
+            add_cookie=add_cookie,
         )
 
-    def _launch_view_chrome(self, row, profile_path, proxy, cookie, profile_name):
+    def _launch_view_chrome(self, row, profile_path, proxy, cookie, profile_name, add_cookie: bool = False):
         # Chạy Chrome trên main thread (giống test.py chạy mượt), KHÔNG dùng
         # QThread. Giữ cửa sổ sống bằng QTimer bơm pipe CDP mỗi 300ms thay vì
         # vòng msleep: mỗi tick gọi 1 hàm Playwright nên pipe luôn được đọc ->
@@ -1539,7 +1379,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             logger.warning("Không mở được Facebook trong Chrome: %s", exc)
 
-        self._sync_view_chrome_cookie(page, context, cookie)
+        if add_cookie:
+            self._sync_view_chrome_cookie(page, context, cookie)
 
         try:
             page.bring_to_front()

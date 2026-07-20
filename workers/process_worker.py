@@ -17,7 +17,6 @@ from integrations.facebook_client import (
 from PyQt5.QtCore import QThread, pyqtSignal
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from services.sql_query_service import AccountDB
-from services.get_2fa import Get_Towfa
 from models.account import Info_data
 from app_config import CHROME_PATH
 from utils.proxy_utils import (
@@ -47,6 +46,7 @@ class Worker_Handle(QThread):
     page_names_signal = pyqtSignal(int, str)
     post_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal(int, str)
+    console_signal = pyqtSignal(str)
 
     def __init__(self, row: int, task: Info_data, action_mode: str = "crawl"):
         super().__init__()
@@ -77,6 +77,10 @@ class Worker_Handle(QThread):
 
     def log_row(self, message: str):
         self.row_signal.emit(self.row, message)
+        logger.info(f"[Row {self.row}] {message}")
+
+    def log_console(self, message: str):
+        self.console_signal.emit(str(message or ""))
         logger.info(f"[Row {self.row}] {message}")
 
     def log_post(self, value: int):
@@ -289,48 +293,6 @@ class Worker_Handle(QThread):
         logger.error(f"[Row {self.row}] Goto thất bại {url}: {last_error}")
         return False
 
-    def get_locator(self, xpath: str):
-        return self.page.locator(f"xpath={xpath}")
-
-    def is_element_visible(self, xpath: str, timeout: int = 3000) -> bool:
-        if self._stop_requested:
-            return False
-
-        try:
-            locator = self.get_locator(xpath)
-            locator.wait_for(state="visible", timeout=timeout)
-            return True
-        except Exception:
-            return False
-
-    def wait_and_fill(self, xpath: str, value: str, timeout: int = 15000) -> bool:
-        if self._stop_requested:
-            return False
-
-        try:
-            locator = self.get_locator(xpath)
-            locator.wait_for(state="visible", timeout=timeout)
-            locator.scroll_into_view_if_needed()
-            locator.fill(str(value))
-            return True
-        except Exception as e:
-            logger.error(f"[Row {self.row}] Lỗi fill xpath={xpath}: {e}")
-            return False
-
-    def wait_and_click(self, xpath: str, timeout: int = 15000) -> bool:
-        if self._stop_requested:
-            return False
-
-        try:
-            locator = self.get_locator(xpath)
-            locator.wait_for(state="visible", timeout=timeout)
-            locator.scroll_into_view_if_needed()
-            locator.click(timeout=timeout)
-            return True
-        except Exception as e:
-            logger.error(f"[Row {self.row}] Lỗi click xpath={xpath}: {e}")
-            return False
-
     def get_cookie_raw(self) -> str:
         cookies = self.context.cookies()
         return "; ".join([f"{c['name']}={c['value']}" for c in cookies])
@@ -355,47 +317,6 @@ class Worker_Handle(QThread):
         cookie_map = self.get_facebook_cookie_map()
         return bool(cookie_map.get("c_user") and cookie_map.get("xs"))
 
-    def wait_and_fill_css(
-        self,
-        selector: str,
-        value: str,
-        timeout: int = 15000,
-        log_errors: bool = False,
-    ) -> bool:
-        if self._stop_requested:
-            return False
-
-        try:
-            locator = self.page.locator(selector).first
-            locator.wait_for(state="visible", timeout=timeout)
-            locator.scroll_into_view_if_needed()
-            locator.fill(str(value))
-            return True
-        except Exception as e:
-            if log_errors:
-                logger.error(f"[Row {self.row}] Lỗi fill selector={selector}: {e}")
-            return False
-
-    def wait_and_click_css(
-        self,
-        selector: str,
-        timeout: int = 15000,
-        log_errors: bool = False,
-    ) -> bool:
-        if self._stop_requested:
-            return False
-
-        try:
-            locator = self.page.locator(selector).first
-            locator.wait_for(state="visible", timeout=timeout)
-            locator.scroll_into_view_if_needed()
-            locator.click(timeout=timeout)
-            return True
-        except Exception as e:
-            if log_errors:
-                logger.error(f"[Row {self.row}] Lỗi click selector={selector}: {e}")
-            return False
-
     def is_css_visible(self, selector: str, timeout: int = 3000) -> bool:
         if self._stop_requested:
             return False
@@ -406,425 +327,6 @@ class Worker_Handle(QThread):
             return True
         except Exception:
             return False
-
-    def click_first_visible(self, selectors: list[str], timeout: int = 5000) -> bool:
-        for selector in selectors:
-            if self.wait_and_click_css(selector, timeout=timeout, log_errors=False):
-                return True
-        return False
-
-    def find_first_visible_locator(self, selectors: list[str], timeout: int = 5000):
-        if self._stop_requested:
-            return None, None
-
-        deadline = time.monotonic() + (timeout / 1000)
-        while time.monotonic() < deadline:
-            if self._stop_requested:
-                return None, None
-
-            for selector in selectors:
-                remaining_ms = int((deadline - time.monotonic()) * 1000)
-                if remaining_ms <= 0:
-                    return None, None
-
-                try:
-                    locator = self.page.locator(selector).first
-                    locator.wait_for(state="visible", timeout=min(250, remaining_ms))
-                    return locator, selector
-                except Exception:
-                    continue
-
-            if not self.sleep_with_stop(0.2):
-                return None, None
-
-        return None, None
-
-    def page_text_contains_any(self, words: list[str], timeout: int = 1500) -> bool:
-        try:
-            body_text = self.page.locator("body").inner_text(timeout=timeout).lower()
-        except Exception:
-            return False
-
-        return any(word.lower() in body_text for word in words)
-
-    def page_looks_like_2fa_challenge(self) -> bool:
-        current_url = (self.page.url or "").lower()
-        if any(
-            marker in current_url
-            for marker in (
-                "checkpoint",
-                "two_factor",
-                "two-factor",
-                "two_step",
-                "two-step",
-                "login/approvals",
-            )
-        ):
-            return True
-
-        return self.page_text_contains_any(
-            [
-                "two-factor",
-                "authentication code",
-                "security code",
-                "login code",
-                "code generator",
-                "enter the code",
-                "nhập mã",
-                "ma xac thuc",
-                "mã xác thực",
-                "mã bảo mật",
-            ]
-        )
-
-    def find_2fa_input(self, timeout: int = 10000):
-        specific_selectors = [
-            'input[name="approvals_code"]',
-            'input#approvals_code',
-            'input[autocomplete="one-time-code"]',
-            'input[inputmode="numeric"]',
-            'input[type="tel"]',
-            'input[aria-label*="code" i]',
-            'input[placeholder*="code" i]',
-            'input[aria-label*="mã" i]',
-            'input[placeholder*="mã" i]',
-            "xpath=/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[2]/div[1]/div[4]/span/span/div/div[2]/div/div/div/div[1]/div[2]/div/div/input",
-            "xpath=/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[2]/div[2]/div[3]/div/div/div[3]/div/div/div[1]/input",
-        ]
-        locator, selector = self.find_first_visible_locator(specific_selectors, timeout=timeout)
-        if locator:
-            return locator, selector
-
-        if not self.page_looks_like_2fa_challenge():
-            return None, None
-
-        generic_selectors = [
-            'input[type="text"][maxlength="6"]',
-            'input[type="text"][maxlength="8"]',
-            'input[type="text"]',
-        ]
-        return self.find_first_visible_locator(generic_selectors, timeout=2000)
-
-    def has_2fa_challenge(self) -> bool:
-        locator, _ = self.find_2fa_input(timeout=1200)
-        return bool(locator)
-
-    def fill_2fa_code(self, input_locator, code: str) -> bool:
-        try:
-            digit_inputs = self.page.locator(
-                'input[maxlength="1"], input[aria-label*="digit" i], input[aria-label*="Digit" i]'
-            )
-            visible_digit_inputs = []
-            for index in range(min(digit_inputs.count(), len(code))):
-                item = digit_inputs.nth(index)
-                try:
-                    if item.is_visible():
-                        visible_digit_inputs.append(item)
-                except Exception:
-                    continue
-
-            if len(visible_digit_inputs) >= len(code):
-                for digit, item in zip(code, visible_digit_inputs):
-                    item.fill(digit)
-                return True
-        except Exception:
-            pass
-
-        try:
-            input_locator.scroll_into_view_if_needed()
-            input_locator.fill(str(code))
-            return True
-        except Exception:
-            try:
-                input_locator.click()
-                input_locator.type(str(code), delay=40)
-                return True
-            except Exception as e:
-                logger.error(f"[Row {self.row}] Loi nhap ma 2FA: {e}")
-                return False
-
-    def submit_2fa_code(self) -> bool:
-        submit_selectors = [
-            'button[type="submit"]',
-            'div[role="button"]:has-text("Continue")',
-            'button:has-text("Continue")',
-            'text="Continue"',
-            'div[role="button"]:has-text("Tiếp tục")',
-            'button:has-text("Tiếp tục")',
-            'text="Tiếp tục"',
-            "xpath=/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[3]/div[2]/div/div",
-            "xpath=/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[3]/div/div/div/div/div/div[2]/div[2]/div/div",
-        ]
-
-        if self.click_first_visible(submit_selectors, timeout=5000):
-            return True
-
-        try:
-            self.page.keyboard.press("Enter")
-            return True
-        except Exception as e:
-            logger.error(f"[Row {self.row}] Khong submit duoc ma 2FA: {e}")
-            return False
-
-    def click_post_login_prompts(self):
-        prompt_selectors = [
-            'div[role="button"]:has-text("Continue")',
-            'button:has-text("Continue")',
-            'text="Continue"',
-            'div[role="button"]:has-text("Tiếp tục")',
-            'button:has-text("Tiếp tục")',
-            'text="Tiếp tục"',
-            'div[role="button"]:has-text("OK")',
-            'button:has-text("OK")',
-        ]
-
-        for _ in range(3):
-            if self.click_first_visible(prompt_selectors, timeout=1000):
-                if not self.sleep_with_stop(0.6):
-                    return
-            else:
-                return
-
-    def handle_2fa_challenge(self) -> bool:
-        if self._stop_requested:
-            return False
-
-        self.log_row("Kiem tra xac minh 2FA")
-        input_locator, selector = self.find_2fa_input(timeout=15000)
-        if not input_locator:
-            self.log_row("Khong phat hien form 2FA")
-            return True
-
-        self.log_row(f"Phat hien form 2FA: {selector}")
-
-        twofa_secret = getattr(self.task, "twofa", "")
-        if not twofa_secret:
-            self.log_row("Tai khoan chua co secret 2FA")
-            return False
-
-        twofa_code = Get_Towfa(twofa_secret, min_seconds_remaining=8)
-        if not twofa_code:
-            self.log_row("Khong lay duoc ma 2FA")
-            return False
-
-        self.log_row("Da lay ma 2FA")
-        if not self.fill_2fa_code(input_locator, str(twofa_code)):
-            self.log_row("Khong nhap duoc ma 2FA")
-            return False
-
-        if not self.sleep_with_stop(0.8):
-            return False
-
-        if not self.submit_2fa_code():
-            self.log_row("Khong submit duoc ma 2FA")
-            return False
-
-        self.log_row("Da submit ma 2FA, dang cho Facebook xac nhan")
-
-        for _ in range(15):
-            if self._stop_requested:
-                return False
-
-            self.click_post_login_prompts()
-            if self.is_logged_in():
-                self.log_row("Xac minh 2FA thanh cong")
-                return True
-
-            if not self.has_2fa_challenge():
-                return True
-
-            if not self.sleep_with_stop(1):
-                return False
-
-        if self.has_2fa_challenge():
-            self.log_row("Form 2FA van hien thi sau khi submit, co the ma da het han hoac bi tu choi")
-            return False
-
-        return True
-
-    def fill_login_form(self) -> bool:
-        filled_any = False
-
-        if getattr(self.task, "email", None):
-            if self.wait_and_fill_css(
-                'input[name="email"]',
-                self.task.email,
-                timeout=5000,
-                log_errors=False,
-            ):
-                self.log_row("Đã nhập email đăng nhập")
-                filled_any = True
-
-        if getattr(self.task, "password", None):
-            if self.wait_and_fill_css(
-                'input[name="pass"]',
-                self.task.password,
-                timeout=5000,
-                log_errors=False,
-            ):
-                self.log_row("Đã nhập mật khẩu đăng nhập")
-                filled_any = True
-
-        return filled_any
-
-    def submit_login_form(self) -> bool:
-        login_selectors = [
-            'button[name="login"]',
-            'div[role="button"]:has-text("Đăng nhập")',
-            'div[role="button"]:has-text("Log in")',
-            'text="Đăng nhập"',
-            'text="Log in"',
-        ]
-
-        if self.click_first_visible(login_selectors, timeout=5000):
-            self.log_row("Đã gửi form đăng nhập")
-            return True
-
-        try:
-            password_locator = self.page.locator('input[name="pass"]').first
-            password_locator.wait_for(state="visible", timeout=3000)
-            password_locator.press("Enter")
-            self.log_row("Đã gửi form đăng nhập bằng Enter")
-            return True
-        except Exception as e:
-            logger.error(f"[Row {self.row}] Không submit được form đăng nhập: {e}")
-            return False
-
-    def relogin_once(self, attempt_number: int) -> bool:
-        self.log_row(f"Thử đăng nhập lại (lần {attempt_number})")
-
-        if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
-            if not self._stop_requested:
-                self.log_row("Không vào được Facebook")
-            return False
-
-        if not self.sleep_with_stop(2):
-            return False
-
-        if self.is_logged_in():
-            return True
-
-        clicked_continue = self.click_first_visible(
-            [
-                'div[role="button"]:has-text("Tiếp tục")',
-                'div[role="button"]:has-text("Continue")',
-                'text="Tiếp tục"',
-                'text="Continue"',
-            ],
-            timeout=3000,
-        )
-        if clicked_continue:
-            self.log_row("Đã click nút tiếp tục phiên đăng nhập")
-            if not self.sleep_with_stop(2):
-                return False
-
-        if self.has_2fa_challenge():
-            self.log_row("Phat hien yeu cau 2FA trong luong dang nhap")
-            if not self.handle_2fa_if_present():
-                return False
-            if not self.sleep_with_stop(2):
-                return False
-            return self.is_logged_in()
-
-        filled_login_form = self.fill_login_form()
-
-        if not filled_login_form and not clicked_continue:
-            self.log_row("Không tìm thấy form đăng nhập hoặc nút tiếp tục")
-            return False
-
-        if filled_login_form and not self.submit_login_form():
-            return False
-
-        try:
-            self.page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-
-        if not self.sleep_with_stop(3):
-            return False
-
-        if not self.handle_2fa_if_present():
-            if self._stop_requested:
-                return False
-            self.log_row("Xử lý 2FA chưa thành công")
-            return False
-
-        if not self.sleep_with_stop(2):
-            return False
-
-        return self.is_logged_in()
-
-    # =========================
-    # 2FA / capture
-    # =========================
-    def handle_2fa_if_present(self) -> bool:
-        if self._stop_requested:
-            return False
-
-        return self.handle_2fa_challenge()
-
-        twofa_layouts = [
-            {
-                "name": "layout_cu",
-                "input": "/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[2]/div[1]/div[4]/span/span/div/div[2]/div/div/div/div[1]/div[2]/div/div/input",
-                "button": "/html/body/div[1]/div[1]/div/div[2]/div/div/div/div/div/div/div/div[3]/div[2]/div/div",
-            },
-            {
-                "name": "layout_moi",
-                "input": "/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[2]/div[2]/div[3]/div/div/div[3]/div/div/div[1]/input",
-                "button": "/html/body/div[1]/div[1]/div/div/div/div/div/div/div/div/div/div/div/div/div/div[3]/div/div/div/div/div/div[2]/div[2]/div/div",
-            },
-        ]
-
-        self.log_row("Kiểm tra xác minh 2FA")
-        matched_layout = None
-
-        for layout in twofa_layouts:
-            if self._stop_requested:
-                return False
-
-            if self.is_element_visible(layout["input"], timeout=5000):
-                matched_layout = layout
-                self.log_row(f"Phát hiện form 2FA: {layout['name']}")
-                break
-
-        if not matched_layout:
-            self.log_row("Không phát hiện form 2FA")
-            return True
-
-        try:
-            twofa_code = None
-
-            if hasattr(self.task, "twofa") and self.task.twofa:
-                twofa_code = Get_Towfa(self.task.twofa)
-
-            if not twofa_code:
-                self.log_row("Không lấy được mã 2FA")
-                return False
-
-            self.log_row("Đã lấy mã 2FA")
-
-        except Exception as e:
-            logger.error(f"[Row {self.row}] Lỗi lấy mã 2FA: {e}")
-            return False
-
-        if not self.wait_and_fill(matched_layout["input"], twofa_code):
-            self.log_row("Không nhập được mã 2FA")
-            return False
-
-        if not self.sleep_with_stop(1):
-            return False
-
-        if not self.wait_and_click(matched_layout["button"]):
-            self.log_row("Không click được nút tiếp tục 2FA")
-            return False
-
-        self.log_row("Đã submit mã 2FA thành công")
-
-        if not self.sleep_with_stop(3):
-            return False
-
-        return True
 
     def on_capture_requests(self, request):
         if self.request_captured or self._stop_requested:
@@ -1004,9 +506,9 @@ class Worker_Handle(QThread):
         """
         LUỒNG 2: kiểm tra tài khoản bằng cookie+token trước khi chạy worker.
         - Hợp lệ  -> trả (cookie, token) để chạy tool ngay.
-        - Không hợp lệ -> refresh token (mở Chrome + Get_Towfa + capture),
-          recheck Graph. Được thì chạy tiếp, thất bại thì trả (None, None)
-          và caller sẽ đặt Status "Có thể nick bị đăng xuất".
+        - Không hợp lệ -> mở Chrome, nếu còn session thì capture cookie/token
+          mới rồi recheck Graph. Nếu nick đã đăng xuất thì KHÔNG tự đăng nhập
+          lại: đặt Status "Cần đăng nhập tay" và trả (None, None) để dừng nick.
         """
         reused = self.try_reuse_saved_cookie_token()
         if reused:
@@ -1060,35 +562,11 @@ class Worker_Handle(QThread):
 
                 self.log_row("Đang kiểm tra tài khoản")
                 if not self.is_logged_in():
-                    self.log_row("Tài khoản bị đăng xuất")
-                    count = 0
-                    relogin_success = False
-
-                    while count < 5:
-                        if self._stop_requested:
-                            return None, None
-
-                        count += 1
-                        try:
-                            relogin_success = self.relogin_once(count)
-                        except Exception as e:
-                            if self._stop_requested:
-                                return None, None
-                            logger.error(f"[Row {self.row}] Lỗi quá trình đăng nhập lại lần {count}: {e}")
-                            relogin_success = False
-
-                        if relogin_success:
-                            self.log_row("Đăng nhập lại thành công")
-                            break
-
-                        self.log_row("Đăng nhập lại chưa thành công, sẽ thử lại")
-
-                        if count < 5 and not self.sleep_with_stop(2):
-                            return None, None
-
-                    if not relogin_success:
-                        self.log_row("Đăng nhập lại thất bại sau nhiều lần thử")
-                        return None, None
+                    # Không tự đăng nhập lại nữa: đánh dấu trạng thái để user đăng
+                    # nhập tay qua chức năng "Đăng nhập (gắn cookie)" rồi dừng nick.
+                    self.persist_account_status("Cần đăng nhập tay")
+                    self.log_row("Tài khoản bị đăng xuất, cần đăng nhập tay")
+                    return None, None
 
                 if self._stop_requested:
                     return None, None
@@ -1106,11 +584,6 @@ class Worker_Handle(QThread):
 
                 if not self.sleep_with_stop(3):
                     return None, None
-
-                if not self.handle_2fa_if_present():
-                    if self._stop_requested:
-                        return None, None
-                    raise Exception("Xử lý 2FA thất bại")
 
                 for capture_attempt in range(1, capture_retry + 1):
                     if self._stop_requested:
@@ -1306,13 +779,6 @@ class Worker_Handle(QThread):
                 f"Khong lay duoc danh sach page tu Graph API, giu nguyen du lieu cu: {self._short_error(last_error)}"
             )
         return None
-
-    def fetch_total_pages(self, token: str = None, cookie: str = None) -> int | None:
-        page_names = self.fetch_page_names_from_graph(token, cookie)
-        if page_names is None:
-            return None
-
-        return len(page_names)
 
     def _extract_page_names_from_current_dom(self) -> list[str]:
         if not self.page:
@@ -1667,6 +1133,7 @@ class Worker_Handle(QThread):
             progress_callback=self.log_interaction,
             status_callback=self.log_row,
             post_callback=self.log_post,
+            console_callback=self.log_console,
             stop_callback=self.is_stop_requested,
         )
 
