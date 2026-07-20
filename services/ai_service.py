@@ -1,5 +1,5 @@
 import requests
-from typing import Optional, Dict, List
+from typing import Dict
 
 
 
@@ -75,62 +75,3 @@ class OpenAIService:
             "sample_models": models[:20],
         }
 
-    def check_model(self) -> Dict:
-        result = self.list_models()
-        if not result.get("ok"):
-            return {"ok": False, "message": result.get("message", "Không tải được danh sách model")}
-
-        models = result.get("models", [])
-        if self.model in models:
-            return {"ok": True, "message": f"Model {self.model} dùng được"}
-        return {"ok": False, "message": f"Model {self.model} không dùng được hoặc chưa được cấp quyền"}
-
-    def ask(self, prompt: str) -> Dict:
-        try:
-            res = requests.post(
-                f"{self.BASE_URL}/responses",
-                headers=self._headers(),
-                json={
-                    "model": self.model,
-                    "input": prompt
-                },
-                timeout=self.timeout
-            )
-
-            if res.status_code == 200:
-                data = res.json()
-                output_text = data.get("output_text", "")
-
-                if not output_text:
-                    try:
-                        output = data.get("output", [])
-                        parts = []
-                        for item in output:
-                            for content in item.get("content", []):
-                                text = content.get("text")
-                                if text:
-                                    parts.append(text)
-                        output_text = "\n".join(parts).strip()
-                    except Exception:
-                        output_text = str(data)
-
-                return {
-                    "ok": True,
-                    "response": output_text,
-                    "raw": data
-                }
-
-            elif res.status_code == 401:
-                return {"ok": False, "message": "API key không hợp lệ hoặc đã bị thu hồi"}
-
-            elif res.status_code == 403:
-                return {"ok": False, "message": "Không có quyền dùng model hoặc endpoint này"}
-
-            elif res.status_code == 429:
-                return {"ok": False, "message": "Hết quota, billing bị tắt hoặc bị giới hạn tốc độ"}
-
-            else:
-                return {"ok": False, "message": f"{res.status_code}: {res.text}"}
-
-        except Exception as e:
-            return {"ok": False, "message": str(e)}

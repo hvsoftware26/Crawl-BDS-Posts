@@ -1,10 +1,8 @@
 # Post service
 from logging import getLogger
-import requests, time
+import time
 from typing import Any, Dict, Optional, Union
-from fake_useragent import UserAgent
-from app_config import HEADERS_FOR_GET_UID
-from integrations.openai_client import check_post_with_openai, filter_posts_with_openai
+from integrations.openai_client import filter_posts_with_openai
 from utils.text_utils import remove_icons_from_text
 from utils.time_utils import format_facebook_created_time
 
@@ -12,12 +10,6 @@ logger = getLogger(__name__)
 DEFAULT_AI_BATCH_SIZE = 20
 
 
-def get_uid_groups(links: str):
-    ua = UserAgent()
-    list_uids= []
-    for link in links:
-        list_uids.append(link.split("groups/")[1].split("/")[0])
-    return list_uids
 def nomalize_post(posts: list[dict],max_length_text: int = 500, stop_callback=None):
     """
     Normalize Facebook posts to a standard format.
@@ -136,7 +128,6 @@ def check_posts_by_AI(
     prompt: Union[str, Dict[str, Any]],
     api_key: str,
     model: Optional[str] = None,
-    proxies: Optional[Dict[str, str]] = None,
     batch_size: int = DEFAULT_AI_BATCH_SIZE,
     stop_callback=None,
 ):
@@ -226,7 +217,6 @@ def check_posts_by_AI(
             prompt=prompt,
             api_key=api_key,
             model=model,
-            proxies=proxies,
         )
 
         if stop_callback and stop_callback():

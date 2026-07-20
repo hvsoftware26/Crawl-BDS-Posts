@@ -30,6 +30,7 @@ class ScanGroups:
         status_callback=None,
         post_callback=None,
         stop_callback=None,
+        console_callback=None,
     ):
         self.groups_list = groups_list
         self.delay = delay
@@ -50,6 +51,7 @@ class ScanGroups:
         self.status_callback = status_callback or (lambda _message: None)
         self.post_callback = post_callback or (lambda _value: None)
         self.stop_callback = stop_callback or (lambda: False)
+        self.console_callback = console_callback or (lambda _message: None)
         self.total_posts_scanned = 0
 
         logger.debug(
@@ -169,6 +171,7 @@ class ScanGroups:
             post_callback = self.post_callback,
             progress_callback = self.progress_callback,
             stop_callback = self.stop_callback,
+            console_callback = self.console_callback,
         )
         posts_status = []
         cycle_valid_posts = []

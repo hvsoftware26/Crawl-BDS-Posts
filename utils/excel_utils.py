@@ -4,6 +4,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 from utils.time_utils import parse_created_time
 
@@ -12,6 +13,8 @@ EXPORTS_DIR = BASE_DIR / "data" / "exports"
 DEFAULT_FONT_NAME = "Calibri"
 DEFAULT_FONT_SIZE = 11
 EXCEL_CREATED_TIME_FORMAT = "%d/%m/%Y %H:%M:%S"
+EXCEL_MAX_COLUMN_WIDTH = 255
+LINK_COLUMN_MIN_WIDTH = 80
 
 
 def safe_filename(text: str) -> str:
@@ -55,6 +58,15 @@ def format_excel_created_time(created_time: str) -> str:
     return str(created_time or "")
 
 
+def build_post_link(post: dict) -> str:
+    return f"https://www.facebook.com/{post.get('id')}"
+
+
+def calculate_link_column_width(links: list[str]) -> int:
+    longest_link = max((len(str(link or "")) for link in links), default=0)
+    return min(EXCEL_MAX_COLUMN_WIDTH, max(LINK_COLUMN_MIN_WIDTH, longest_link + 4))
+
+
 def build_group_posts_excel(
     group_id: str,
     posts: list[dict],
@@ -77,17 +89,21 @@ def build_group_posts_excel(
     body_font = Font(name=DEFAULT_FONT_NAME, size=DEFAULT_FONT_SIZE)
     header_font = Font(name=DEFAULT_FONT_NAME, size=DEFAULT_FONT_SIZE, bold=True)
     wrap_alignment = Alignment(vertical="top", horizontal="left", wrap_text=True)
+    no_wrap_alignment = Alignment(vertical="top", horizontal="left", wrap_text=False)
+    link_column_index = 2 if include_group_column else 1
+    link_column_letter = get_column_letter(link_column_index)
+    post_links = [build_post_link(post) for post in posts]
 
     worksheet.append(headers)
-    for cell in worksheet[1]:
+    for column_index, cell in enumerate(worksheet[1], start=1):
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = wrap_alignment
+        cell.alignment = no_wrap_alignment if column_index == link_column_index else wrap_alignment
         cell.border = border
 
-    for post in posts:
+    for post, post_link in zip(posts, post_links):
         row = [
-            f"https://www.facebook.com/{post.get('id')}",
+            post_link,
             format_excel_created_time(post.get("created_time")),
             sanitize_excel_message(post.get("message")),
         ]
@@ -96,20 +112,22 @@ def build_group_posts_excel(
         worksheet.append(row)
 
     for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
-        for cell in row:
+        for column_index, cell in enumerate(row, start=1):
             cell.font = body_font
-            cell.alignment = wrap_alignment
+            cell.alignment = no_wrap_alignment if column_index == link_column_index else wrap_alignment
             cell.border = border
 
     if include_group_column:
         worksheet.column_dimensions["A"].width = 45
-        worksheet.column_dimensions["B"].width = 40
+        worksheet.column_dimensions["B"].width = calculate_link_column_width(post_links)
         worksheet.column_dimensions["C"].width = 22
         worksheet.column_dimensions["D"].width = 120
     else:
-        worksheet.column_dimensions["A"].width = 40
+        worksheet.column_dimensions["A"].width = calculate_link_column_width(post_links)
         worksheet.column_dimensions["B"].width = 22
         worksheet.column_dimensions["C"].width = 120
+
+    worksheet.column_dimensions[link_column_letter].bestFit = True
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 

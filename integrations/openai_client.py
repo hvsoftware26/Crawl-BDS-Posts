@@ -106,7 +106,6 @@ def generate_comment_with_openai(
     prompt: Union[str, Dict[str, Any]],
     api_key: str,
     model: Optional[str] = None,
-    proxies: Optional[Dict[str, str]] = None,
     timeout: int = 45,
 ) -> str:
     if not isinstance(post, dict) or not post:
@@ -151,17 +150,15 @@ def generate_comment_with_openai(
     }
 
     logger.info(
-        "Generating AI comment: post_id=%s model=%s has_proxies=%s timeout=%ss",
+        "Generating AI comment: post_id=%s model=%s timeout=%ss",
         post.get("id"),
         resolved_model,
-        bool(proxies),
         timeout,
     )
     response = requests.post(
         OPENAI_RESPONSES_API_URL,
         headers=_build_headers(api_key),
         json=request_payload,
-        proxies=proxies,
         timeout=timeout,
     )
     if response.status_code != 200:
@@ -194,113 +191,11 @@ def generate_comment_with_openai(
     return comment
 
 
-def check_post_with_openai(
-    post: Dict[str, Any],
-    prompt: Union[str, Dict[str, Any]],
-    api_key: str,
-    model: Optional[str] = None,
-    proxies: Optional[Dict[str, str]] = None,
-    timeout: int = 30,
-) -> Dict[str, Any]:
-    if not isinstance(post, dict) or not post:
-        raise ValueError("Post is required")
-
-    instructions, resolved_model = _resolve_prompt_config(prompt, model=model)
-    logger.info(
-        "Sending post to OpenAI for evaluation: post_id=%s model=%s has_proxies=%s timeout=%ss",
-        post.get("id"),
-        resolved_model,
-        bool(proxies),
-        timeout,
-    )
-    request_payload = {
-        "model": resolved_model,
-        "instructions": instructions,
-        "input": json.dumps(post, ensure_ascii=False),
-        "store": False,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "post_check_result",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "is_match": {
-                            "type": "boolean",
-                            "description": "True when the post matches the prompt.",
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Short explanation for the decision.",
-                        },
-                    },
-                    "required": ["is_match", "reason"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-    }
-
-    response = requests.post(
-        OPENAI_RESPONSES_API_URL,
-        headers=_build_headers(api_key),
-        json=request_payload,
-        proxies=proxies,
-        timeout=timeout,
-    )
-    if response.status_code != 200:
-        logger.error(
-            "OpenAI request failed: post_id=%s status_code=%s body=%s",
-            post.get("id"),
-            response.status_code,
-            response.text,
-        )
-        raise Exception(f"OpenAI request failed: {response.text}")
-
-    logger.debug(
-        "OpenAI request completed: post_id=%s status_code=%s",
-        post.get("id"),
-        response.status_code,
-    )
-    raw_result = _extract_output_text(response.json())
-    if not raw_result:
-        logger.error("OpenAI returned empty response for post_id=%s", post.get("id"))
-        raise ValueError("OpenAI returned an empty response")
-
-    try:
-        parsed_result = json.loads(raw_result)
-    except json.JSONDecodeError as exc:
-        logger.error(
-            "OpenAI returned invalid JSON for post_id=%s raw_result=%s",
-            post.get("id"),
-            raw_result,
-        )
-        raise ValueError(f"OpenAI returned invalid JSON: {raw_result}") from exc
-
-    if "is_match" not in parsed_result:
-        logger.error(
-            "OpenAI response missing is_match for post_id=%s parsed_result=%s",
-            post.get("id"),
-            parsed_result,
-        )
-        raise ValueError("OpenAI response does not include 'is_match'")
-
-    logger.info(
-        "OpenAI classified post_id=%s is_match=%s reason=%s",
-        post.get("id"),
-        parsed_result.get("is_match"),
-        str(parsed_result.get("reason", ""))[:200],
-    )
-    return parsed_result
-
-
 def filter_posts_with_openai(
     posts: list[Dict[str, Any]],
     prompt: Union[str, Dict[str, Any]],
     api_key: str,
     model: Optional[str] = None,
-    proxies: Optional[Dict[str, str]] = None,
     timeout: int = 90,
 ) -> list[Dict[str, Any]]:
     if not isinstance(posts, list) or not posts:
@@ -321,10 +216,9 @@ def filter_posts_with_openai(
         return []
 
     logger.info(
-        "Sending batch posts to OpenAI for evaluation: posts_count=%s model=%s has_proxies=%s timeout=%ss",
+        "Sending batch posts to OpenAI for evaluation: posts_count=%s model=%s timeout=%ss",
         len(request_posts),
         resolved_model,
-        bool(proxies),
         timeout,
     )
     request_payload = {
@@ -367,7 +261,6 @@ def filter_posts_with_openai(
         OPENAI_RESPONSES_API_URL,
         headers=_build_headers(api_key),
         json=request_payload,
-        proxies=proxies,
         timeout=timeout,
     )
     if response.status_code != 200:

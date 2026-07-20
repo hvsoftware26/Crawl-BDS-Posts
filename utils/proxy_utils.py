@@ -131,14 +131,6 @@ def build_playwright_proxy(proxy_value: str | None) -> dict | None:
     return proxy
 
 
-def build_chrome_proxy_server(proxy_value: str | None) -> str:
-    config = parse_proxy(proxy_value)
-    if not config:
-        return ""
-
-    return config.server
-
-
 def build_requests_proxies(proxy_value: str | None) -> dict | None:
     config = parse_proxy(proxy_value)
     if not config:
@@ -390,89 +382,3 @@ def verify_browser_proxy_ip(
     }
 
 
-def test_proxy_connectivity(
-    proxy_value: str | None,
-    test_url: str = "https://www.facebook.com/",
-    timeout: int = 8,
-    attempts: int = 1,
-    session=None,
-) -> dict:
-    config = parse_proxy(proxy_value)
-    if not config:
-        return {
-            "ok": True,
-            "message": "Không dùng proxy",
-            "status_code": None,
-        }
-
-    http = session or requests.Session()
-    total_attempts = max(1, int(attempts or 1))
-    last_result = None
-
-    for attempt_number in range(1, total_attempts + 1):
-        try:
-            response = http.get(
-                test_url,
-                headers={
-                    "accept": "*/*",
-                    "user-agent": "Mozilla/5.0",
-                },
-                proxies=build_requests_proxies(proxy_value),
-                timeout=timeout,
-                allow_redirects=False,
-            )
-        except requests.exceptions.ProxyError as exc:
-            last_result = {
-                "ok": False,
-                "message": f"Proxy lỗi hoặc bị reset: {_safe_proxy_error(exc, config)}",
-                "status_code": None,
-                "attempts": attempt_number,
-            }
-            continue
-        except requests.exceptions.Timeout as exc:
-            last_result = {
-                "ok": False,
-                "message": f"Proxy timeout sau {timeout}s: {_safe_proxy_error(exc, config)}",
-                "status_code": None,
-                "attempts": attempt_number,
-            }
-            continue
-        except requests.exceptions.RequestException as exc:
-            last_result = {
-                "ok": False,
-                "message": f"Không kết nối được qua proxy: {_safe_proxy_error(exc, config)}",
-                "status_code": None,
-                "attempts": attempt_number,
-            }
-            continue
-
-        if response.status_code == 407:
-            return {
-                "ok": False,
-                "message": "Proxy yêu cầu xác thực hoặc sai user/pass.",
-                "status_code": response.status_code,
-                "attempts": attempt_number,
-            }
-
-        if response.status_code >= 400:
-            last_result = {
-                "ok": False,
-                "message": f"Proxy trả về HTTP {response.status_code}.",
-                "status_code": response.status_code,
-                "attempts": attempt_number,
-            }
-            continue
-
-        return {
-            "ok": True,
-            "message": f"Proxy kết nối được, HTTP {response.status_code}.",
-            "status_code": response.status_code,
-            "attempts": attempt_number,
-        }
-
-    return last_result or {
-        "ok": False,
-        "message": "Không kết nối được qua proxy.",
-        "status_code": None,
-        "attempts": total_attempts,
-    }

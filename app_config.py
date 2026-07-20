@@ -59,14 +59,6 @@ def build_local_profile_path(profile_name: str) -> Path:
     return (PROFILE_ROOT_DIR / sanitize_profile_name(profile_name)).resolve()
 
 
-def build_profile_path_from_email(email: str) -> str:
-    email_value = str(email or "").strip()
-    if not email_value or "@" not in email_value:
-        raise ValueError("Email không hợp lệ")
-
-    profile_name = email_value.split("@", 1)[0]
-    return str(build_local_profile_path(profile_name))
-
 #seting for API Facebook
 DEFAULT_HEADERS = {
     'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
