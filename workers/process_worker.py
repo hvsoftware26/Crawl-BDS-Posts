@@ -172,10 +172,13 @@ class Worker_Handle(QThread):
                 "--disable-extensions",
             ]
 
+            browser_headless = bool(getattr(self.task, "browser_headless", False))
+            self.log_row("Che do Chrome: An" if browser_headless else "Che do Chrome: Hien")
+
             launch_options = {
                 "user_data_dir": self.task.path_chrome,
                 "executable_path": CHROME_PATH,
-                "headless": False,
+                "headless": browser_headless,
                 "args": browser_args,
             }
             if proxy_settings:
