@@ -1,12 +1,14 @@
 import requests
 from typing import Dict
 
+from app_config import OPENAI_MODEL_NAME
+
 
 
 class OpenAIService:
     BASE_URL = "https://api.openai.com/v1"
 
-    def __init__(self, api_key: str, model: str = "gpt-5-mini", timeout: int = 30):
+    def __init__(self, api_key: str, model: str = OPENAI_MODEL_NAME, timeout: int = 30):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
