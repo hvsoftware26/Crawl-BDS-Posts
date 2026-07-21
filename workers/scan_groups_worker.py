@@ -14,10 +14,10 @@ class ScanGroups:
         groups_list: list[str],
         delay: int,
         keywords: list[str],
-        recent_window_minutes: float = None,
         account_token: str = None,
         account_cookies: str = None,
         account_name: str = None,
+        account_page_names: list[str] | None = None,
         proxies: dict = None,
         API_KEY: str = None,
         token_tele: str = None,
@@ -31,14 +31,15 @@ class ScanGroups:
         post_callback=None,
         stop_callback=None,
         console_callback=None,
+        browser_context=None,
     ):
         self.groups_list = groups_list
         self.delay = delay
-        self.recent_window_minutes = recent_window_minutes
         self.keywords = keywords
         self.account_token = account_token
         self.account_cookies = account_cookies
         self.account_name = account_name
+        self.account_page_names = account_page_names or []
         self.proxies = proxies
         self.API_KEY = API_KEY
         self.prompt = prompt
@@ -52,6 +53,7 @@ class ScanGroups:
         self.post_callback = post_callback or (lambda _value: None)
         self.stop_callback = stop_callback or (lambda: False)
         self.console_callback = console_callback or (lambda _message: None)
+        self.browser_context = browser_context
         self.total_posts_scanned = 0
 
         logger.debug(
@@ -157,10 +159,10 @@ class ScanGroups:
             groups_list=self.groups_list,
             delay_next_run=self.delay,
             keywords=self.keywords,
-            recent_window_minutes=self.recent_window_minutes,
             account_token=self.account_token,
             account_cookies=self.account_cookies,
             account_name=self.account_name,
+            account_page_names=self.account_page_names,
             proxies=self.proxies,
             API_KEY=self.API_KEY,
             prompt = self.prompt,
@@ -172,6 +174,7 @@ class ScanGroups:
             progress_callback = self.progress_callback,
             stop_callback = self.stop_callback,
             console_callback = self.console_callback,
+            browser_context = self.browser_context,
         )
         posts_status = []
         cycle_valid_posts = []
