@@ -393,6 +393,7 @@ class MainWindow(QMainWindow):
             keywords_list=[],
             prompt_cmt="",
             prompt_cmt_mode="text",
+            browser_headless=False,
         )
 
     def update_interact_group(self, row: int, text: str):
@@ -1528,6 +1529,7 @@ class MainWindow(QMainWindow):
         prompt = self.read_text_file(self.prompt_file_path)
         prompt_cmt = self.read_text_file(self.prompt_cmt_file_path)
         prompt_cmt_mode = "ai" if self.uic.radio_prompt_cmt_ai.isChecked() else "text"
+        browser_headless = self.uic.radio_hide_chrome.isChecked()
         if not prompt_cmt:
             default_comment_filename = "comment_AI.txt" if prompt_cmt_mode == "ai" else "comment.txt"
             default_comment_path = APP_BASE_DIR / default_comment_filename
@@ -1608,6 +1610,7 @@ class MainWindow(QMainWindow):
                     keywords_list=keywords_list,
                     prompt_cmt=prompt_cmt,
                     prompt_cmt_mode=prompt_cmt_mode,
+                    browser_headless=browser_headless,
                 )
             )
 
