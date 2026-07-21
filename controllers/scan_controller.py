@@ -85,10 +85,10 @@ class ScanController:
         groups_list,
         delay,
         keywords,
-        recent_window_minutes=None,
         account_token=None,
         account_cookies=None,
         account_name=None,
+        account_page_names=None,
         proxies=None,
         API_KEY=None,
         token_tele=None,
@@ -102,15 +102,16 @@ class ScanController:
         post_callback=None,
         stop_callback=None,
         console_callback=None,
+        browser_context=None,
 
     ):
         self.groups_list = groups_list
         self.delay = delay
-        self.recent_window_minutes = recent_window_minutes
         self.keywords = keywords
         self.account_token = account_token
         self.account_cookies = account_cookies
         self.account_name = account_name
+        self.account_page_names = account_page_names or []
         self.proxies = proxies
         self.API_KEY = API_KEY
         self.token_tele = token_tele
@@ -124,6 +125,7 @@ class ScanController:
         self.post_callback = post_callback
         self.stop_callback = stop_callback
         self.console_callback = console_callback
+        self.browser_context = browser_context
         self.schedule_service = ScheduleService()
         logger.debug(
             "Initialized ScanController: groups=%s delay_hours=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
@@ -170,10 +172,10 @@ class ScanController:
             groups_list=self.groups_list,
             delay = self.delay,
             keywords=self.keywords,
-            recent_window_minutes=self.recent_window_minutes,
             account_token=self.account_token,
             account_cookies=self.account_cookies,
             account_name=self.account_name,
+            account_page_names=self.account_page_names,
             proxies=self.proxies,
             API_KEY=self.API_KEY,
             token_tele=self.token_tele,
@@ -187,6 +189,7 @@ class ScanController:
             post_callback = self.post_callback,
             stop_callback = self.stop_callback,
             console_callback = self.console_callback,
+            browser_context = self.browser_context,
         )
 
         posts_status = scan_groups_worker.get_groups()
