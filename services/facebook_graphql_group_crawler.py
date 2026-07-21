@@ -13,12 +13,14 @@ from typing import Any
 
 from app_config import (
     GRAPHQL_GROUP_IDLE_TIMEOUT_SECONDS,
+    GRAPHQL_GROUP_MAX_RELOADS,
     GRAPHQL_GROUP_MAX_SCROLLS,
     GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT,
     GRAPHQL_GROUP_POST_LIMIT,
     GRAPHQL_GROUP_SCROLL_DELAY_MAX_SECONDS,
     GRAPHQL_GROUP_SCROLL_DELAY_MIN_SECONDS,
     GRAPHQL_GROUP_SCROLL_DELAY_SECONDS,
+    GRAPHQL_GROUP_STALE_SCROLLS_BEFORE_RELOAD,
 )
 from services.group_scan_state_service import (
     normalize_group_state_key,
@@ -400,6 +402,8 @@ class FacebookGraphQLGroupCrawler:
         idle_timeout_seconds: float = GRAPHQL_GROUP_IDLE_TIMEOUT_SECONDS,
         scroll_delay_seconds: float = GRAPHQL_GROUP_SCROLL_DELAY_SECONDS,
         no_height_change_limit: int = GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT,
+        max_reloads: int = GRAPHQL_GROUP_MAX_RELOADS,
+        stale_scrolls_before_reload: int = GRAPHQL_GROUP_STALE_SCROLLS_BEFORE_RELOAD,
         status_callback=None,
         stop_callback=None,
     ):
@@ -413,6 +417,8 @@ class FacebookGraphQLGroupCrawler:
         self.idle_timeout_seconds = max(1.0, float(idle_timeout_seconds or GRAPHQL_GROUP_IDLE_TIMEOUT_SECONDS))
         self.scroll_delay_seconds = max(0.2, float(scroll_delay_seconds or GRAPHQL_GROUP_SCROLL_DELAY_SECONDS))
         self.no_height_change_limit = max(1, int(no_height_change_limit or GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT))
+        self.max_reloads = max(0, int(max_reloads or 0))
+        self.stale_scrolls_before_reload = max(1, int(stale_scrolls_before_reload or GRAPHQL_GROUP_STALE_SCROLLS_BEFORE_RELOAD))
         self.status_callback = status_callback or (lambda _message: None)
         self.stop_callback = stop_callback or (lambda: False)
 
@@ -424,6 +430,7 @@ class FacebookGraphQLGroupCrawler:
         self.stop_scanning = False
         self.stop_reason = None
         self.scroll_count = 0
+        self.reload_count = 0
         self.last_graphql_monotonic = None
         self.last_graphql_response_at = None
         self.collected_posts = []
@@ -445,6 +452,7 @@ class FacebookGraphQLGroupCrawler:
             status=status,
             valid_posts_count=len(self.collected_posts),
             scroll_count=self.scroll_count,
+            reload_count=self.reload_count,
             last_graphql_response_at=self.last_graphql_response_at,
             stop_reason=self.stop_reason,
             error=error,
@@ -659,6 +667,36 @@ class FacebookGraphQLGroupCrawler:
         except Exception:
             return {"scrollTop": 0, "scrollHeight": 0, "viewportHeight": 0, "atBottom": False}
 
+    def _reload_group_page(self, reason: str) -> bool:
+        if self.reload_count >= self.max_reloads:
+            return False
+
+        self.reload_count += 1
+        self.status_callback(
+            "Reload group vi chua bat duoc feed moi (%s/%s)"
+            % (self.reload_count, self.max_reloads)
+        )
+        logger.info(
+            "[Group %s] Reloading group page: reason=%s reload=%s/%s progress=%s/%s",
+            self.group_key,
+            reason,
+            self.reload_count,
+            self.max_reloads,
+            len(self.collected_posts),
+            self.max_posts,
+        )
+
+        try:
+            self.page.goto(self.group_url, wait_until="domcontentloaded", timeout=60000)
+            if not self._wait_with_stop(random.uniform(2.8, 5.0)):
+                return False
+            self._drain_response_queue()
+            self._state_update("running")
+            return not self.stop_scanning and not self.stop_callback()
+        except Exception as exc:
+            logger.warning("[Group %s] Could not reload group page: %s", self.group_key, exc)
+            return False
+
     def collect(self) -> dict:
         if not self.browser_context:
             raise RuntimeError("Missing Playwright browser context for GraphQL group crawler")
@@ -670,6 +708,7 @@ class FacebookGraphQLGroupCrawler:
         self._state_update("running")
         started_at = time.monotonic()
         no_height_change_count = 0
+        stale_scroll_count = 0
 
         try:
             self.page = self.browser_context.new_page()
@@ -698,10 +737,20 @@ class FacebookGraphQLGroupCrawler:
 
                 last_response = self.last_graphql_monotonic or started_at
                 if time.monotonic() - last_response >= self.idle_timeout_seconds and self.scroll_count > 0:
+                    if (
+                        self.reload_count < self.max_reloads
+                        and len(self.collected_posts) < self.max_posts
+                        and self._reload_group_page("graphql_idle_timeout")
+                    ):
+                        stale_scroll_count = 0
+                        no_height_change_count = 0
+                        started_at = time.monotonic()
+                        continue
                     self._set_stop_reason("graphql_idle_timeout")
                     break
 
                 response_before_scroll = self.last_graphql_monotonic
+                posts_before_scroll = len(self.collected_posts)
                 before = self._scroll_once()
                 if self.stop_scanning:
                     break
@@ -720,6 +769,23 @@ class FacebookGraphQLGroupCrawler:
                     self.last_graphql_monotonic is not None
                     and self.last_graphql_monotonic != response_before_scroll
                 )
+                has_new_post = len(self.collected_posts) > posts_before_scroll
+                if has_new_response or has_new_post:
+                    stale_scroll_count = 0
+                else:
+                    stale_scroll_count += 1
+
+                if (
+                    stale_scroll_count >= self.stale_scrolls_before_reload
+                    and self.reload_count < self.max_reloads
+                    and len(self.collected_posts) < self.max_posts
+                ):
+                    if self._reload_group_page("stale_scrolls_without_group_feed"):
+                        stale_scroll_count = 0
+                        no_height_change_count = 0
+                        started_at = time.monotonic()
+                        continue
+
                 if (
                     not has_new_response
                     and int(after.get("scrollHeight") or 0) <= int(before.get("beforeHeight") or 0)
@@ -747,6 +813,7 @@ class FacebookGraphQLGroupCrawler:
                 "total_posts": len(self.collected_posts),
                 "posts": list(self.collected_posts),
                 "scroll_count": self.scroll_count,
+                "reload_count": self.reload_count,
                 "last_graphql_response_at": self.last_graphql_response_at,
                 "stop_reason": self.stop_reason,
             }
