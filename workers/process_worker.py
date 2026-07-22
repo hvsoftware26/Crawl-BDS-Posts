@@ -18,7 +18,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from services.sql_query_service import AccountDB
 from models.account import Info_data
-from app_config import CHROME_PATH
+from app_config import BROWSER_RESTART_EVERY_GROUPS, CHROME_PATH
 from utils.proxy_utils import (
     build_playwright_proxy,
     build_requests_proxies,
@@ -27,6 +27,11 @@ from utils.proxy_utils import (
 from utils.facebook_cookies import has_facebook_login_cookie
 from utils.proxy_utils import verify_browser_proxy_ip
 from utils.security import mask_cookie, mask_secret
+from utils.browser_performance import (
+    block_heavy_resources,
+    enable_vps_lightweight_mode,
+    is_out_of_memory_page,
+)
 
 logging.basicConfig(
     filename="main.log",
@@ -170,6 +175,14 @@ class Worker_Handle(QThread):
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "--webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "--disable-extensions",
+                "--blink-settings=imagesEnabled=false",
+                "--disable-remote-fonts",
+                "--autoplay-policy=user-gesture-required",
+                "--disable-notifications",
+                "--disable-push-api",
+                "--disable-component-update",
+                "--disable-domain-reliability",
+                "--disable-breakpad",
             ]
 
             browser_headless = bool(getattr(self.task, "browser_headless", False))
@@ -180,15 +193,17 @@ class Worker_Handle(QThread):
                 "executable_path": CHROME_PATH,
                 "headless": browser_headless,
                 "args": browser_args,
+                "service_workers": "block",
             }
             if proxy_settings:
                 launch_options["proxy"] = proxy_settings
                 self.log_row(f"Đang dùng proxy Playwright: {mask_proxy(getattr(self.task, 'proxy', ''))}")
 
             self.context = self.playwright.chromium.launch_persistent_context(**launch_options)
-            # KHÔNG dùng context.route("**/*") ở đây. Với proxy có auth, mỗi request
-            # bị interception phải đi lại challenge 407 -> trang treo/quay mãi
-            # (đã xác nhận qua test.py). Bỏ resource-blocking để proxy auth hoạt động.
+            block_heavy_resources(self.context)
+            enable_vps_lightweight_mode(self.context)
+            # Không dùng context.route("**/*"): proxy có auth có thể bị lặp 407.
+            # CDP chỉ chặn URL ở tầng Chrome nên không làm thay đổi luồng proxy.
             if proxy_settings:
                 self._verify_playwright_proxy(getattr(self.task, "proxy", ""))
         except Exception as e:
@@ -285,6 +300,8 @@ class Worker_Handle(QThread):
             try:
                 self.log_row(f"Truy cập: {url} (lần {attempt})")
                 self.page.goto(url, wait_until=wait_until, timeout=30000)
+                if is_out_of_memory_page(self.page):
+                    raise RuntimeError("Chrome Out of Memory")
                 return True
             except Exception as e:
                 last_error = e
@@ -1199,6 +1216,7 @@ class Worker_Handle(QThread):
             console_callback=self.log_console,
             stop_callback=self.is_stop_requested,
             browser_context=self.context,
+            browser_restart_callback=self._restart_browser_for_memory,
         )
 
         logger.info("Bắt đầu scan group=%s", total_groups)
@@ -1214,6 +1232,22 @@ class Worker_Handle(QThread):
 
         self.log_row(f"Đã xử lý xong {total_groups} group trong chu kỳ này")
         return True
+
+    def _restart_browser_for_memory(self):
+        """Restart Chrome between groups and return the replacement context."""
+
+        if self._stop_requested:
+            return None
+        self.log_row(
+            f"Da xu ly {BROWSER_RESTART_EVERY_GROUPS} group, dang khoi dong lai Chrome de giai phong RAM"
+        )
+        self.close()
+        if not self.sleep_with_stop(1):
+            return None
+        if not self.prepare_worker_browser_session():
+            raise RuntimeError("Khong the khoi dong lai Chrome sau khi giai phong RAM")
+        self.log_row("Da khoi dong lai Chrome, tiep tuc quet group")
+        return self.context
 
     # =========================
     # Main thread flow
