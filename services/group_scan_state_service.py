@@ -106,6 +106,7 @@ def update_group_scan_metadata(
     status: str | None = None,
     valid_posts_count: int | None = None,
     scroll_count: int | None = None,
+    reload_count: int | None = None,
     last_graphql_response_at: str | None = None,
     stop_reason: str | None = None,
     error: str | None = None,
@@ -133,6 +134,8 @@ def update_group_scan_metadata(
                 group_state["valid_posts_count"] = int(valid_posts_count)
             if scroll_count is not None:
                 group_state["scroll_count"] = int(scroll_count)
+            if reload_count is not None:
+                group_state["reload_count"] = int(reload_count)
             if last_graphql_response_at is not None:
                 group_state["last_graphql_response_at"] = last_graphql_response_at
             if stop_reason is not None:

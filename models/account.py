@@ -26,3 +26,4 @@ class Info_data:
     keywords_list: Optional[List[str]] #List
     prompt_cmt: str = ""
     prompt_cmt_mode: str = "text"
+    browser_headless: bool = False

@@ -444,11 +444,25 @@ class Ui_MainWindow(object):
 
         self.lbl_banned_keywords = LabelBox("Keywords Cấm")
         self.edit_banned_keywords = PlaceholderPathEdit("Nhập keyword cấm...")
+        self.radio_hide_chrome = QRadioButton("Ẩn Chrome")
+        self.radio_show_chrome = QRadioButton("Hiện Chrome")
+        self.radio_show_chrome.setChecked(True)
+        self.browser_mode_group = QButtonGroup(MainWindow)
+        self.browser_mode_group.addButton(self.radio_hide_chrome)
+        self.browser_mode_group.addButton(self.radio_show_chrome)
+
+        self.browser_mode_widget = QWidget()
+        self.browser_mode_layout = QVBoxLayout(self.browser_mode_widget)
+        self.browser_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.browser_mode_layout.setSpacing(0)
+        self.browser_mode_layout.addWidget(self.radio_hide_chrome)
+        self.browser_mode_layout.addWidget(self.radio_show_chrome)
 
         control_items = [
             self.lbl_threads, self.spn_threads,
             self.lbl_cycle_hours, self.spn_cycle_hours,
             self.lbl_banned_keywords, self.edit_banned_keywords,
+            self.browser_mode_widget,
         ]
         for i, widget in enumerate(control_items):
             self.controls.addWidget(widget, 0, i)
