@@ -1,9 +1,0 @@
-Dựa trên nội dung và từ ngữ trong bài viết, hãy xác định xem người đăng có nhu cầu tìm trọ hoặc thuê trọ hay không. Chỉ trả lời bằng 'Yes' nếu có nhu cầu, hoặc 'No' nếu không.
-
-Nhiệm vụ: Xác định các bài viết có nhu cầu tìm trọ hoặc thuê trọ."
-
-Tiêu chí đánh giá:"
-- Bài viết được coi là PHÙ HỢP nếu người đăng thể hiện rõ ràng họ đang tìm trọ, thuê trọ, cần phòng, cần nơi ở."
-- Chấp nhận các cách diễn đạt thông dụng, viết tắt, slang (ví dụ: 'tìm phòng', 'cần phòng gấp', 'thuê trọ',
-'có ai cho thuê', 'cần chỗ ở', 'tìm roommate', ...)."
-- Loại bỏ các bài đăng cho thuê, đăng tin bất động sản, quảng cáo, hoặc nội dung không liên quan."

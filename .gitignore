@@ -37,6 +37,13 @@ env/
 # Project specific
 Profile-Chrome/
 data/app.db
+data/posts.json
+data/group_scan_state.json
+database/accounts.db
+database/accounts.db-*
+tele.json
+comment_AI.txt
+comment_san.txt
 logs/
 .env
 *.log

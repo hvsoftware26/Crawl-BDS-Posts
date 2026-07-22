@@ -67,6 +67,7 @@ class Worker_Handle(QThread):
 
         self._stop_requested = False
         self._playwright_thread_id = None
+        self.account_page_names = []
 
     # =========================
     # Logging helpers
@@ -144,9 +145,8 @@ class Worker_Handle(QThread):
             self.playwright = sync_playwright().start()
             proxy_settings = build_playwright_proxy(getattr(self.task, "proxy", ""))
             browser_args = [
-                "--headless=new",
-                "--window-position=-32000,-32000",
-                "--window-size=600,540",
+                "--window-position=30,30",
+                "--window-size=500,700",
                 "--lang=vi-VN",
                 "--accept-lang=vi-VN,vi",
                 "--disable-blink-features=AutomationControlled",
@@ -175,7 +175,7 @@ class Worker_Handle(QThread):
             launch_options = {
                 "user_data_dir": self.task.path_chrome,
                 "executable_path": CHROME_PATH,
-                "headless": True,
+                "headless": False,
                 "args": browser_args,
             }
             if proxy_settings:
@@ -686,6 +686,39 @@ class Worker_Handle(QThread):
         self.log_row("Lấy cookie và token thất bại sau nhiều lần thử")
         return None, None
 
+    def prepare_worker_browser_session(self) -> bool:
+        if self._stop_requested:
+            return False
+
+        try:
+            if not self.context or not self.page:
+                self._start_browser()
+
+            if self._stop_requested:
+                return False
+
+            self.log_row("Kiem tra phien Facebook bang Playwright")
+            if not self.safe_goto("https://www.facebook.com/?locale=vi_VN", wait_until="domcontentloaded"):
+                return False
+
+            if not self.sleep_with_stop(random.uniform(2, 4)):
+                return False
+
+            if not self.is_logged_in():
+                self.persist_account_status("Cần đăng nhập tay")
+                self.log_row("Tai khoan bi dang xuat, can dang nhap tay")
+                return False
+
+            self.cookie_raw = self.get_cookie_raw()
+            self.eaag_token = str(getattr(self.task, "token", "") or "").strip() or None
+            self.log_row("Phien Facebook hop le, san sang quet Group bang GraphQL")
+            return True
+        except Exception as exc:
+            logger.exception("[Row %s] Khong chuan bi duoc browser session: %s", self.row, exc)
+            self.log_row(f"Khong chuan bi duoc browser session: {self._short_error(exc)}")
+            self.close()
+            return False
+
     @staticmethod
     def _normalize_page_name(name: str) -> str:
         return " ".join(str(name or "").split()).strip()
@@ -970,6 +1003,33 @@ class Worker_Handle(QThread):
             db.update_page_count_by_path(self.task.path_chrome, page_count)
             self.log_page_count(page_count)
 
+    def _load_account_page_info_from_db(self) -> tuple[int, list[str]]:
+        account = AccountDB(None).find_account_by_exact_path(self.task.path_chrome) or {}
+        try:
+            page_count = int(account.get("Page_Count") or 0)
+        except (TypeError, ValueError):
+            page_count = 0
+
+        page_names = self._dedupe_page_names(
+            str(account.get("Page_Names") or "").splitlines()
+        )
+        return page_count, page_names
+
+    def _ensure_account_has_pages_before_crawl(self) -> bool:
+        page_count, page_names = self._load_account_page_info_from_db()
+        self.account_page_names = page_names
+        self.log_page_count(page_count)
+        self.log_page_names(page_names)
+
+        if page_count <= 0:
+            self.log_row("Phải có trang mới cho chạy")
+            return False
+
+        if not page_names:
+            self.log_row("Chưa có danh sách tên page trong DB, hãy cập nhật số page trước khi chạy")
+
+        return True
+
     def run_check_uid_status(self) -> str:
         self.log_row("Đang kiểm tra UID Facebook")
         uid = resolve_facebook_uid(
@@ -1117,12 +1177,12 @@ class Worker_Handle(QThread):
         self.scanner = ScanController(
             groups_list=self.task.groups_list,
             delay=float(self.task.delay_get_post_gr),
-            recent_window_minutes=float(self.task.cycle_total or 0) * 60,
             keywords=self.task.keywords_list,
             API_KEY=self.task.api_key,
             account_token=self.eaag_token,
             account_cookies=self.cookie_raw,
             account_name=self.task.account_name,
+            account_page_names=self.account_page_names,
             proxies=build_requests_proxies(getattr(self.task, "proxy", "")),
             token_tele=self.task.token_tele,
             idchat=self.task.id_chat,
@@ -1135,6 +1195,7 @@ class Worker_Handle(QThread):
             post_callback=self.log_post,
             console_callback=self.log_console,
             stop_callback=self.is_stop_requested,
+            browser_context=self.context,
         )
 
         logger.info("Bắt đầu scan group=%s", total_groups)
@@ -1188,19 +1249,22 @@ class Worker_Handle(QThread):
 
                 self.log_row(f"Bắt đầu chu kỳ {cycle_index}")
 
+                if not self._ensure_account_has_pages_before_crawl():
+                    final_status = "Phải có trang mới cho chạy"
+                    break
+
                 # =========================
-                # LOGIN / CHECK ACCOUNT (LUỒNG 2)
-                # Check account bằng cookie+token -> hợp lệ chạy luôn;
-                # không hợp lệ thì refresh token rồi recheck Graph.
+                # LOGIN / CHECK ACCOUNT
+                # Crawl posts now uses the logged-in Playwright session and GraphQL responses.
                 # =========================
-                self.cookie_raw, self.eaag_token = self.prepare_worker_account()
+                browser_ready = self.prepare_worker_browser_session()
 
                 if self._stop_requested:
                     final_status = "Đã dừng"
                     break
 
-                if not self.cookie_raw or not self.eaag_token:
-                    # Sau N lần refresh vẫn không lấy được token hợp lệ.
+                if not browser_ready:
+                    # Khong co browser session hop le de mo Facebook Group.
                     final_status = "Có thể nick bị đăng xuất"
                     self.log_row(final_status)
                     break

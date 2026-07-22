@@ -1,0 +1,10 @@
+Dựa trên nội dung và từ ngữ trong bài viết, hãy xác định xem người đăng có nhu cầu cho thuê trọ, cho thuê phòng hoặc tìm người thuê hay không. Chỉ trả lời bằng 'Yes' nếu có nhu cầu, hoặc 'No' nếu không.
+
+Nhiệm vụ: Xác định các bài viết có nhu cầu cho thuê trọ hoặc tìm người thuê trọ.
+
+Tiêu chí đánh giá:
+
+* Bài viết được coi là PHÙ HỢP nếu người đăng thể hiện rõ ràng họ đang có phòng, phòng trọ, nhà trọ hoặc chỗ ở cần cho thuê và đang tìm người thuê.
+* Chấp nhận các cách diễn đạt thông dụng, viết tắt, slang, ví dụ: 'cho thuê phòng', 'còn phòng', 'phòng trống', 'cần người thuê', 'tìm người ở', 'pass phòng', 'nhượng phòng', 'có phòng cho thuê', 'tuyển roommate', 'cần người ở ghép', ...
+* Loại bỏ các bài đăng tìm trọ, cần thuê phòng, cần chỗ ở, tìm nơi ở, hỏi thuê trọ, quảng cáo không liên quan hoặc nội dung không thể hiện nhu cầu cho thuê.
+* Chỉ trả lời chính xác một trong hai giá trị: 'Yes' hoặc 'No'. Không giải thích và không thêm bất kỳ nội dung nào khác.

@@ -1,5 +1,5 @@
 ﻿# Main GUI
-import sys, os, json, shutil
+import sys, os, json, shutil, logging
 from logging import getLogger
 from pathlib import Path
 from typing import List
@@ -34,6 +34,7 @@ from utils.security import mask_secret
 from app_config import (
     APP_BASE_DIR,
     CHROME_PATH,
+    OPENAI_MODEL_NAME,
 )
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
 UID_CHECK_DEFAULT_THREADS = 8
@@ -58,6 +59,36 @@ VIEW_CHROME_NETWORK_ARGS = [
     "--webrtc-ip-handling-policy=disable_non_proxied_udp",
     "--disable-blink-features=AutomationControlled",
 ]
+
+
+def reset_runtime_logs():
+    reset_file_handler = False
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+
+        try:
+            handler.acquire()
+            if handler.stream:
+                handler.flush()
+                handler.stream.seek(0)
+                handler.stream.truncate()
+            reset_file_handler = True
+        except Exception:
+            logger.exception("Could not reset runtime log handler")
+        finally:
+            try:
+                handler.release()
+            except Exception:
+                pass
+
+    if reset_file_handler:
+        return
+
+    try:
+        (APP_BASE_DIR / "main.log").write_text("", encoding="utf-8")
+    except Exception:
+        logger.exception("Could not reset runtime log file")
 
 
 def ensure_profile_directory(path_chrome: str) -> str:
@@ -158,6 +189,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.uic = Ui_MainWindow()
         self.uic.setupUi(self)
+        reset_runtime_logs()
+        self.uic.console.clear()
 
         self.group_count = 0
         self.profile_lines: List[str] = []
@@ -522,6 +555,9 @@ class MainWindow(QMainWindow):
                 )
                 return
 
+        reset_runtime_logs()
+        self.uic.console.clear()
+
         # Crawl worker chạy vòng lặp vô hạn (không tự kết thúc), nên account bị
         # xếp hàng chờ luồng sẽ không bao giờ được crawl. Vì vậy chạy tất cả
         # account đã chọn cùng lúc; "Số luồng" không giới hạn crawl flow nữa.
@@ -757,7 +793,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            model_name = 'gpt-5-mini'
+            model_name = OPENAI_MODEL_NAME
             service = OpenAIService(api_key=api_key, model=model_name, timeout=20)
             result = service.check_api_key()
 

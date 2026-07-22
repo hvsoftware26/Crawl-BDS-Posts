@@ -1,22 +1,17 @@
 # Group service
 import time
-from datetime import datetime
 from logging import getLogger
 
-from integrations.facebook_client import (
-    FacebookClient,
-    comment_post_as_random_page,
-    get_managed_pages_with_tokens,
-)
-from integrations.openai_client import generate_comment_with_openai
+from integrations.openai_client import NoCommentDecision, generate_comment_with_openai
+from app_config import GRAPHQL_GROUP_POST_LIMIT, OPENAI_MODEL_NAME
+from services.facebook_browser_commenter import FacebookBrowserCommenter
 from services.post_service import (
     build_posts_status,
     check_posts_by_AI,
-    nomalize_post,
     rm_non_keywords_posts,
 )
 from services.group_scan_state_service import load_processed_post_ids, remember_processed_posts
-from utils.time_utils import HANOI_TIMEZONE, is_created_time_within_delay_window
+from services.facebook_graphql_group_crawler import FacebookGraphQLGroupCrawler
 
 logger = getLogger(__name__)
 
@@ -27,10 +22,10 @@ class GroupService:
         groups_list: list[str],
         delay_next_run: int,
         keywords: list[str],
-        recent_window_minutes: float = None,
         account_token: str = None,
         account_cookies: str = None,
         account_name: str = None,
+        account_page_names: list[str] | None = None,
         proxies: dict = None,
         API_KEY: str = None,
         prompt: str = None,
@@ -42,21 +37,20 @@ class GroupService:
         post_callback=None,
         stop_callback=None,
         console_callback=None,
+        browser_context=None,
     ):
-        self.facebook_client = FacebookClient(session=None)
         self.groups_list = groups_list
         self.delay_next_run = delay_next_run * 60
-        self.recent_window_seconds = (
-            float(recent_window_minutes) * 60
-            if recent_window_minutes is not None
-            else self.delay_next_run
-        )
         self.keywords = keywords
         self.account_token = account_token
         self.account_cookies = account_cookies
         self.account_name = account_name
+        self.account_page_names = [
+            " ".join(str(page_name or "").split()).strip()
+            for page_name in (account_page_names or [])
+            if str(page_name or "").strip()
+        ]
         self.proxies = proxies
-        self._managed_pages_cache = None
         self.prompt = prompt
         self.prompt_cmt = prompt_cmt
         self.prompt_cmt_mode = prompt_cmt_mode
@@ -67,29 +61,18 @@ class GroupService:
         self.post_callback = post_callback or (lambda _value: None)
         self.stop_callback = stop_callback or (lambda: False)
         self.console_callback = console_callback or (lambda _message: None)
+        self.browser_context = browser_context
         logger.debug(
-            "Initialized GroupService: groups=%s delay_seconds=%s recent_window_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
+            "Initialized GroupService: groups=%s delay_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s has_browser_context=%s",
             len(groups_list or []),
             self.delay_next_run,
-            self.recent_window_seconds,
             len(keywords or []),
             bool(account_token),
             bool(account_cookies),
             bool(proxies),
             bool(API_KEY),
+            bool(browser_context),
         )
-
-    @staticmethod
-    def _shorten_comment_id(comment_id) -> str:
-        # comment_id dạng ownerid_postid_commentid. Bỏ ownerid, giữ postid,
-        # cắt commentid còn 12 ký tự cho gọn trên console log.
-        raw = str(comment_id or "").strip()
-        if not raw:
-            return "?"
-        parts = raw.split("_")
-        if len(parts) >= 3:
-            return f"{parts[-2]}_{parts[-1][:12]}"
-        return raw
 
     def _is_fixed_comment_enabled(self) -> bool:
         return (
@@ -116,7 +99,8 @@ class GroupService:
                 post=post,
                 prompt=self.prompt_cmt,
                 api_key=self.API_KEY,
-                model="gpt-5-mini",
+                model=OPENAI_MODEL_NAME,
+                max_attempts=3,
             )
             return comment_message, "ai"
 
@@ -125,23 +109,7 @@ class GroupService:
 
         return str(self.prompt_cmt or "").strip(), "text"
 
-    def _get_cached_managed_pages(self) -> list[dict]:
-        if self._managed_pages_cache is not None:
-            return self._managed_pages_cache
-
-        self._managed_pages_cache = get_managed_pages_with_tokens(
-            account_token=self.account_token,
-            account_cookies=self.account_cookies,
-            account_name=self.account_name,
-            proxies=self.proxies,
-        )
-        logger.info(
-            "Cached managed page tokens for current run: pages=%s",
-            len(self._managed_pages_cache),
-        )
-        return self._managed_pages_cache
-
-    def _comment_valid_posts(self, posts_status: list[dict]) -> list[dict]:
+    def _comment_valid_posts_with_browser(self, posts_status: list[dict]) -> list[dict]:
         if not posts_status:
             return posts_status
 
@@ -156,88 +124,104 @@ class GroupService:
         comment_mode = str(self.prompt_cmt_mode or "text").strip().casefold()
         if comment_mode == "ai" and not self._is_ai_comment_enabled():
             logger.info("Skip AI commenting because AI comment prompt is empty")
-            self.status_callback("Bỏ qua comment AI vì chưa có prompt")
+            self.status_callback("Bo qua comment AI vi chua co prompt")
             return posts_status
 
         if comment_mode == "text" and not self._is_fixed_comment_enabled():
-            logger.info("Skip commenting because fixed comment content is empty")
-            self.status_callback("Bỏ qua comment vì chưa có nội dung cmt sẵn")
+            logger.info("Skip browser commenting because fixed comment content is empty")
+            self.status_callback("Bo qua comment vi chua co noi dung cmt san")
             return posts_status
 
         if comment_mode == "ai" and not self.API_KEY:
             logger.info("Skip AI commenting because OpenAI API key is empty")
-            self.status_callback("Bỏ qua comment AI vì chưa có API key")
+            self.status_callback("Bo qua comment AI vi chua co API key")
             return posts_status
 
-        if not self.account_token:
-            logger.info("Skip commenting because account token is empty")
-            self.status_callback("Bỏ qua comment vì chưa có token Facebook")
+        if not self.browser_context:
+            logger.info("Skip browser commenting because browser context is missing")
+            self.status_callback("Bo qua comment vi chua co Chrome dang dang nhap")
             return posts_status
 
-        self.status_callback(f"Bắt đầu comment {len(valid_posts)} bài viết phù hợp")
+        self.status_callback(f"Bat dau comment {len(valid_posts)} bai phu hop bang Chrome")
+        commenter = FacebookBrowserCommenter(
+            browser_context=self.browser_context,
+            account_name=self.account_name,
+            page_names=self.account_page_names,
+            status_callback=self.status_callback,
+            stop_callback=self.stop_callback,
+        )
 
         try:
-            managed_pages = self._get_cached_managed_pages()
-        except Exception as e:
-            logger.warning("Failed to cache managed page tokens before commenting: %s", e)
-            self.status_callback(f"Khong lay duoc token page de comment: {e}")
-            for post in valid_posts:
-                post["comment_status"] = 0
-                post["comment_error"] = str(e)
-            return posts_status
+            for index, post in enumerate(valid_posts, start=1):
+                if self.stop_callback and self.stop_callback():
+                    return posts_status
 
-        for index, post in enumerate(valid_posts, start=1):
-            if self.stop_callback and self.stop_callback():
-                return posts_status
-
-            post_id = post.get("id")
-            try:
-                comment_message, comment_source = self._build_comment_message_for_post(post)
-                result = comment_post_as_random_page(
-                    post_url_or_id=post_id,
-                    message=comment_message,
-                    account_token=self.account_token,
-                    account_cookies=self.account_cookies,
-                    account_name=self.account_name,
-                    proxies=self.proxies,
-                    managed_pages=managed_pages,
-                )
-                post["comment_status"] = 1
-                post["comment_id"] = result.get("comment_id")
-                post["comment_page_id"] = result.get("page_id")
-                post["comment_page_name"] = result.get("page_name")
-                post["comment_message"] = comment_message
-                post["comment_source"] = comment_source
-                logger.info(
-                    "Commented valid post successfully: post_id=%s comment_id=%s page_name=%s",
-                    post_id,
-                    result.get("comment_id"),
-                    result.get("page_name"),
-                )
-                self.status_callback(
-                    "Đã comment %s/%s bài hợp lệ bằng page %s (comment_id: %s)"
-                    % (
-                        index,
-                        len(valid_posts),
-                        result.get("page_name") or "",
-                        result.get("comment_id") or "?",
+                post_id = post.get("id")
+                try:
+                    comment_message, comment_source = self._build_comment_message_for_post(post)
+                    result = commenter.comment_post(post, comment_message)
+                    post["comment_status"] = 1
+                    post["comment_id"] = result.get("comment_id") or ""
+                    post["comment_method"] = result.get("method") or "browser"
+                    post["comment_page_name"] = result.get("page_name")
+                    post["comment_message"] = comment_message
+                    post["comment_source"] = comment_source
+                    logger.info(
+                        "Commented valid post by browser successfully: post_id=%s page_name=%s url=%s",
+                        post_id,
+                        result.get("page_name"),
+                        result.get("post_url"),
                     )
-                )
-                self.console_callback(
-                    "Đã comment page %s | comment_id: %s"
-                    % (
-                        result.get("page_name") or "",
-                        self._shorten_comment_id(result.get("comment_id")),
+                    self.status_callback(
+                        "Da comment %s/%s bai hop le bang Chrome/page %s"
+                        % (
+                            index,
+                            len(valid_posts),
+                            result.get("page_name") or "",
+                        )
                     )
-                )
-            except Exception as e:
-                post["comment_status"] = 0
-                post["comment_error"] = str(e)
-                logger.warning("Failed to comment valid post_id=%s: %s", post_id, e)
-                self.status_callback("Comment thất bại bài %s/%s" % (index, len(valid_posts)))
+                    self.console_callback(
+                        "Da comment bang Chrome/page %s | post_id: %s"
+                        % (
+                            result.get("page_name") or "",
+                            post_id or "?",
+                        )
+                    )
+                except NoCommentDecision as e:
+                    post["comment_status"] = 0
+                    post["comment_skipped"] = True
+                    post["comment_decision"] = "No"
+                    post["comment_error"] = "AI_NO_COMMENT"
+                    post["comment_method"] = "browser"
+                    post["comment_source"] = "ai"
+                    logger.info("Skipped browser-comment because AI returned No: post_id=%s", post_id)
+                    self.status_callback(
+                        "AI tra ve No, bo qua comment bai %s/%s"
+                        % (index, len(valid_posts))
+                    )
+                    self.console_callback(
+                        "Bo qua comment do AI tra ve No | post_id: %s"
+                        % (post_id or "?")
+                    )
+                except Exception as e:
+                    post["comment_status"] = 0
+                    post["comment_error"] = str(e)
+                    post["comment_method"] = "browser"
+                    logger.warning("Failed to browser-comment valid post_id=%s: %s", post_id, e)
+                    short_error = " ".join(str(e or "").split())[:160]
+                    self.status_callback(
+                        "Comment that bai bai %s/%s: %s"
+                        % (index, len(valid_posts), short_error)
+                    )
+                    self.console_callback(
+                        "Comment that bai | post_id: %s | error: %s"
+                        % (post_id or "?", short_error)
+                    )
 
-            if not self.sleep_with_stop(1):
-                return posts_status
+                if not self.sleep_with_stop(1):
+                    return posts_status
+        finally:
+            commenter.close()
 
         return posts_status
 
@@ -247,24 +231,6 @@ class GroupService:
                 return False
             time.sleep(0.1)
         return True
-
-    def _filter_recent_posts(self, posts: list[dict], reference_time: datetime):
-        recent_posts = [
-            post
-            for post in posts
-            if is_created_time_within_delay_window(
-                post.get("created_time"),
-                self.recent_window_seconds,
-                now=reference_time,
-            )
-        ]
-        logger.debug(
-            "Filtered recent posts: input_posts=%s recent_posts=%s reference_time=%s",
-            len(posts or []),
-            len(recent_posts),
-            reference_time.isoformat(),
-        )
-        return recent_posts
 
     def _filter_unprocessed_posts(self, posts: list[dict], processed_post_ids: set[str]):
         if not processed_post_ids:
@@ -290,181 +256,43 @@ class GroupService:
             )
         return filtered_posts, skipped_count
 
-    def _has_posts_older_than_window(self, posts: list[dict], reference_time: datetime):
-        has_older_posts = any(
-            post.get("created_time")
-            and not is_created_time_within_delay_window(
-                post.get("created_time"),
-                self.recent_window_seconds,
-                now=reference_time,
-            )
-            for post in posts
-        )
-        if has_older_posts:
-            logger.debug(
-                "Detected posts older than delay window: posts_count=%s reference_time=%s",
-                len(posts or []),
-                reference_time.isoformat(),
-            )
-        return has_older_posts
+    def _collect_posts_graphql(self, group_id: str, processed_post_ids: set[str] | None = None):
+        if not self.browser_context:
+            raise RuntimeError("Chua co Playwright browser context de quet GraphQL")
 
-    def _extend_unique_posts(
-        self,
-        current_posts: list[dict],
-        new_posts: list[dict],
-        seen_post_ids: set[str],
-    ):
-        added_count = 0
-        duplicated_count = 0
-        for post in new_posts:
-            post_id = post.get("id")
-            if post_id and post_id in seen_post_ids:
-                duplicated_count += 1
-                continue
-
-            current_posts.append(post)
-            if post_id:
-                seen_post_ids.add(post_id)
-            added_count += 1
-
-        logger.debug(
-            "Extended unique posts: incoming=%s added=%s duplicated=%s total_unique=%s",
-            len(new_posts or []),
-            added_count,
-            duplicated_count,
-            len(current_posts),
-        )
-        return added_count
-
-    def _collect_recent_posts(self, group_id: str, processed_post_ids: set[str] | None = None):
-        all_recent_posts = []
-        seen_post_ids = set()
-        processed_post_ids = set(processed_post_ids or set())
-        skipped_processed_count = 0
-        stopped_by_processed_post = False
-        page_number = 1
-        consecutive_pages_without_new_posts = 0
-        reference_time = datetime.now(HANOI_TIMEZONE)
         logger.info(
-            "Start collecting recent posts: group_id=%s reference_time=%s delay_seconds=%s recent_window_seconds=%s",
+            "Start collecting posts with GraphQL: group_id=%s",
             group_id,
-            reference_time.isoformat(),
-            self.delay_next_run,
-            self.recent_window_seconds,
         )
-        self.status_callback('Bắt đầu thu thập bài viết')
+        self.status_callback(f"Đang quét 0/{GRAPHQL_GROUP_POST_LIMIT} bài")
         if not self.sleep_with_stop(1):
             return
-        response = self.facebook_client.get_posts_from_group(
-            group_id=group_id,
-            account_token=self.account_token,
-            account_cookies=self.account_cookies,
-            proxies=self.proxies,
+
+        crawler = FacebookGraphQLGroupCrawler(
+            browser_context=self.browser_context,
+            group_url=group_id,
+            processed_post_ids=processed_post_ids,
+            status_callback=self.status_callback,
             stop_callback=self.stop_callback,
         )
-        if not response or response.get("stopped"):
+        result = crawler.collect()
+        if not result:
             return
-        resolved_group_id = response.get("id") or group_id
-        if resolved_group_id and resolved_group_id != group_id:
-            processed_post_ids.update(load_processed_post_ids(resolved_group_id))
-
-        while True:
-            page_posts = nomalize_post(response.get("posts", []),self.max_length_text, stop_callback=self.stop_callback)
-            recent_posts = self._filter_recent_posts(page_posts, reference_time)
-            unprocessed_recent_posts, page_skipped_processed = self._filter_unprocessed_posts(
-                recent_posts,
-                processed_post_ids,
-            )
-            skipped_processed_count += page_skipped_processed
-            added_recent_posts = self._extend_unique_posts(
-                all_recent_posts,
-                unprocessed_recent_posts,
-                seen_post_ids,
-            )
-            if added_recent_posts == 0:
-                consecutive_pages_without_new_posts += 1
-            else:
-                consecutive_pages_without_new_posts = 0
-
-            logger.info(
-                "Collected page for group_id=%s page=%s normalized_posts=%s recent_posts=%s skipped_processed_posts=%s added_recent_posts=%s total_unique_recent_posts=%s consecutive_pages_without_new_posts=%s",
-                group_id,
-                page_number,
-                len(page_posts),
-                len(recent_posts),
-                page_skipped_processed,
-                added_recent_posts,
-                len(all_recent_posts),
-                consecutive_pages_without_new_posts,
-            )
-            self.status_callback(f"Đã thu thập {len(all_recent_posts)} bài viết gần đây")
-            if not self.sleep_with_stop(1):
-                return
-
-            if page_skipped_processed:
-                stopped_by_processed_post = True
-                logger.info(
-                    "Stop paging group_id=%s at page=%s because processed posts were reached: skipped_processed=%s",
-                    group_id,
-                    page_number,
-                    page_skipped_processed,
-                )
-                self.status_callback("Gặp bài đã xử lý trước đó, dừng thu thập sớm")
-                if not self.sleep_with_stop(1):
-                    return
-                break
-
-            if consecutive_pages_without_new_posts >= 3:
-                logger.info(
-                    "Stop paging group_id=%s at page=%s because there were %s consecutive pages without new recent posts",
-                    group_id,
-                    page_number,
-                    consecutive_pages_without_new_posts,
-                )
-                self.status_callback("Không còn bài viết mới gần đây, dừng thu thập")
-                if not self.sleep_with_stop(1):
-                    return
-                break
-
-            next_api = response.get("next_api")
-            if not next_api:
-                logger.info(
-                    "Stop paging group_id=%s at page=%s because next_api is empty",
-                    group_id,
-                    page_number,
-                )
-                self.status_callback("Đã thu thập hết bài viết gần đây")
-                if not self.sleep_with_stop(1):
-                    return
-                break
-
-            response = self.facebook_client.get_posts_from_next_api(
-                next_api=next_api,
-                account_cookies=self.account_cookies,
-                proxies=self.proxies,
-                stop_callback=self.stop_callback,
-            )
-            if not response or response.get("stopped"):
-                return
-            page_number += 1
 
         logger.info(
-            "Finished collecting recent posts: group_id=%s total_recent_posts=%s pages_scanned=%s",
+            "Finished collecting GraphQL posts: group_id=%s total_posts=%s scroll_count=%s stop_reason=%s",
             group_id,
-            len(all_recent_posts),
-            page_number,
+            result.get("total_posts"),
+            result.get("scroll_count"),
+            result.get("stop_reason"),
         )
-        self.status_callback(f"Hoàn thành thu thập bài viết gần đây: {len(all_recent_posts)} bài viết")
+        self.status_callback(
+            "Đã quét %s/%s bài"
+            % (result.get("total_posts", 0), GRAPHQL_GROUP_POST_LIMIT)
+        )
         if not self.sleep_with_stop(1):
             return
-        return {
-            "group_id": group_id,
-            "state_group_id": resolved_group_id,
-            "total_posts": len(all_recent_posts),
-            "posts": all_recent_posts,
-            "skipped_processed_count": skipped_processed_count,
-            "stopped_by_processed_post": stopped_by_processed_post,
-        }
+        return result
 
     def _filter_posts_for_output(self, posts: list[dict]):
         logger.info(
@@ -504,7 +332,7 @@ class GroupService:
             posts=keyword_filtered_posts,
             prompt=self.prompt,
             api_key=self.API_KEY,
-            model="gpt-5-mini",
+            model=OPENAI_MODEL_NAME,
             stop_callback=self.stop_callback,
         )
         logger.info(
@@ -543,7 +371,7 @@ class GroupService:
 
             try:
                 processed_post_ids = load_processed_post_ids(group_id)
-                res_posts = self._collect_recent_posts(
+                res_posts = self._collect_posts_graphql(
                     group_id,
                     processed_post_ids=processed_post_ids,
                 )
@@ -562,11 +390,14 @@ class GroupService:
                     }
                     continue
                 logger.info(
-                    "Collected %s recent posts from group %s",
+                    "Collected %s posts from group %s",
                     res_posts.get("total_posts"),
                     group_id,
                 )
-                self.status_callback(f"Thu thập {res_posts.get('total_posts')} bài viết gần đây")
+                self.status_callback(
+                    "Đã quét %s/%s bài"
+                    % (res_posts.get("total_posts", 0), GRAPHQL_GROUP_POST_LIMIT)
+                )
                 if not self.sleep_with_stop(1):
                     return
                 full_posts = res_posts.get("posts", [])
@@ -591,7 +422,7 @@ class GroupService:
                     group_id=res_posts.get("group_id"),
                     stop_callback = self.stop_callback,
                 )
-                posts_status = self._comment_valid_posts(posts_status)
+                posts_status = self._comment_valid_posts_with_browser(posts_status)
                 remember_processed_posts(
                     group_id,
                     posts_status,
@@ -606,7 +437,7 @@ class GroupService:
 
                 if len(posts_status) == 0:
                     logger.info(
-                        "private group" if self._has_posts_older_than_window(full_posts, datetime.now(HANOI_TIMEZONE)) else "no relevant posts",
+                        "private group or no relevant posts",
                         extra={"group_id": group_id},
                     )
                     self.status_callback("Nhóm riêng tư hoặc không có bài viết")

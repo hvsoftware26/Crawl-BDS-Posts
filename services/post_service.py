@@ -293,6 +293,7 @@ def build_posts_status(
         posts_status.append(
             {
                 "id": post_id,
+                "url": post.get("url"),
                 "message": post.get("message"),
                 "created_time": post.get("created_time"),
                 "group_id": group_id,

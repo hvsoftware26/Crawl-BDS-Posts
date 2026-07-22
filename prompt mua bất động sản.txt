@@ -1,0 +1,32 @@
+Dựa vào tiêu đề bài viết, hãy xác định người đăng có thực sự đang tìm mua bất động sản hay không.
+
+Quy tắc:
+
+* Trả về "Yes" khi người đăng thể hiện rõ chính họ hoặc người thân đang cần mua, tìm mua, cần tìm đất, tìm nhà hoặc có ngân sách để mua bất động sản.
+* Trả về "No" nếu bài viết có dấu hiệu bán, quảng cáo, môi giới, tìm khách hoặc chào nguồn hàng.
+
+Các dấu hiệu trả về "No":
+
+* Có từ hoặc cụm từ như: bán, cần bán, sang nhượng, chính chủ bán, ra hàng, xả hàng, cần sỉ, bán sỉ, sỉ nền, sỉ lô, nguyên cụm, nguyên block.
+* Nêu số lượng sản phẩm đang có như: 10 nền, 15 nền, 20 lô, nhiều nền, cả cụm đất.
+* Mô tả sản phẩm như: mặt tiền, kích thước, diện tích, sổ sẵn, pháp lý, giá bán, vị trí hoặc tiện ích.
+* Có lời kêu gọi liên hệ như: lh, ib, gọi em, xem thông tin, xem tt, xem đất, chốt nền.
+* Có số điện thoại để người khác liên hệ mua hàng.
+* Có nội dung như: "khách cần mua liên hệ em", "có khách cần mua", "tìm hàng cho khách", "chủ gửi hàng", "bên em có đất".
+
+Lưu ý:
+
+* Không nhận diện là nhu cầu mua chỉ vì bài viết có từ "cần".
+* Các cụm "cần bán", "cần sỉ", "cần ra hàng", "cần sang nhượng" đều là bài bán.
+* Bài viết có số lượng nền hoặc lô, thông số đất, tình trạng sổ và số điện thoại liên hệ phải được coi là bài bán hoặc quảng cáo.
+
+Ví dụ:
+
+* "Em cần mua đất Đồng Nai tầm 500 triệu" → Yes
+* "Cần tìm 1 lô đất thổ cư để ở" → Yes
+* "Khách cần mua bất động sản liên hệ em" → No
+* "Cần sỉ 15 nền Chơn Thành, mặt tiền nhựa 16m, diện tích 5x40, sổ sẵn, liên hệ..." → No
+* "Có 20 nền giá tốt, sổ sẵn, xem đất gọi..." → No
+
+Yêu cầu đầu ra:
+Chỉ trả về duy nhất "Yes" hoặc "No". Không giải thích, không thêm ký tự hoặc nội dung khác.
