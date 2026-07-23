@@ -103,6 +103,7 @@ class ScanController:
         stop_callback=None,
         console_callback=None,
         browser_context=None,
+        browser_restart_callback=None,
 
     ):
         self.groups_list = groups_list
@@ -126,6 +127,7 @@ class ScanController:
         self.stop_callback = stop_callback
         self.console_callback = console_callback
         self.browser_context = browser_context
+        self.browser_restart_callback = browser_restart_callback
         self.schedule_service = ScheduleService()
         logger.debug(
             "Initialized ScanController: groups=%s delay_hours=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s",
@@ -190,6 +192,7 @@ class ScanController:
             stop_callback = self.stop_callback,
             console_callback = self.console_callback,
             browser_context = self.browser_context,
+            browser_restart_callback=self.browser_restart_callback,
         )
 
         posts_status = scan_groups_worker.get_groups()

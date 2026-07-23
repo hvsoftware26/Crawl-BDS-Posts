@@ -14,6 +14,7 @@ from typing import Any
 from app_config import (
     GRAPHQL_GROUP_IDLE_TIMEOUT_SECONDS,
     GRAPHQL_GROUP_MAX_RELOADS,
+    GRAPHQL_GROUP_MAX_OOM_RELOADS,
     GRAPHQL_GROUP_MAX_SCROLLS,
     GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT,
     GRAPHQL_GROUP_POST_LIMIT,
@@ -27,6 +28,7 @@ from services.group_scan_state_service import (
     update_group_scan_metadata,
 )
 from utils.time_utils import DISPLAY_DATE_FORMAT, HANOI_TIMEZONE
+from utils.browser_performance import is_out_of_memory_page
 
 logger = getLogger(__name__)
 
@@ -403,6 +405,7 @@ class FacebookGraphQLGroupCrawler:
         scroll_delay_seconds: float = GRAPHQL_GROUP_SCROLL_DELAY_SECONDS,
         no_height_change_limit: int = GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT,
         max_reloads: int = GRAPHQL_GROUP_MAX_RELOADS,
+        max_oom_reloads: int = GRAPHQL_GROUP_MAX_OOM_RELOADS,
         stale_scrolls_before_reload: int = GRAPHQL_GROUP_STALE_SCROLLS_BEFORE_RELOAD,
         status_callback=None,
         stop_callback=None,
@@ -418,6 +421,7 @@ class FacebookGraphQLGroupCrawler:
         self.scroll_delay_seconds = max(0.2, float(scroll_delay_seconds or GRAPHQL_GROUP_SCROLL_DELAY_SECONDS))
         self.no_height_change_limit = max(1, int(no_height_change_limit or GRAPHQL_GROUP_NO_HEIGHT_CHANGE_LIMIT))
         self.max_reloads = max(0, int(max_reloads or 0))
+        self.max_oom_reloads = max(0, int(max_oom_reloads or 0))
         self.stale_scrolls_before_reload = max(1, int(stale_scrolls_before_reload or GRAPHQL_GROUP_STALE_SCROLLS_BEFORE_RELOAD))
         self.status_callback = status_callback or (lambda _message: None)
         self.stop_callback = stop_callback or (lambda: False)
@@ -431,6 +435,7 @@ class FacebookGraphQLGroupCrawler:
         self.stop_reason = None
         self.scroll_count = 0
         self.reload_count = 0
+        self.oom_reload_count = 0
         self.last_graphql_monotonic = None
         self.last_graphql_response_at = None
         self.collected_posts = []
@@ -697,6 +702,43 @@ class FacebookGraphQLGroupCrawler:
             logger.warning("[Group %s] Could not reload group page: %s", self.group_key, exc)
             return False
 
+    def _recover_out_of_memory_page(self) -> bool:
+        if not is_out_of_memory_page(self.page):
+            return True
+        if self.oom_reload_count >= self.max_oom_reloads:
+            self._set_stop_reason("chrome_out_of_memory")
+            return False
+
+        self.oom_reload_count += 1
+        self.status_callback(
+            "Chrome het bo nho, dang tai lai group (%s/%s)"
+            % (self.oom_reload_count, self.max_oom_reloads)
+        )
+        logger.warning(
+            "[Group %s] Chrome Out of Memory; reloading page %s/%s",
+            self.group_key,
+            self.oom_reload_count,
+            self.max_oom_reloads,
+        )
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=60000)
+            if not self._wait_with_stop(random.uniform(2.8, 5.0)):
+                return False
+            self._drain_response_queue()
+            self._state_update("running")
+            return not self.stop_scanning and not self.stop_callback()
+        except Exception as exc:
+            logger.warning("[Group %s] OOM reload failed: %s", self.group_key, exc)
+            try:
+                self.page.goto(self.group_url, wait_until="domcontentloaded", timeout=60000)
+                if not self._wait_with_stop(random.uniform(2.8, 5.0)):
+                    return False
+                self._drain_response_queue()
+                return not self.stop_scanning and not self.stop_callback()
+            except Exception as goto_exc:
+                logger.warning("[Group %s] OOM fallback navigation failed: %s", self.group_key, goto_exc)
+                return False
+
     def collect(self) -> dict:
         if not self.browser_context:
             raise RuntimeError("Missing Playwright browser context for GraphQL group crawler")
@@ -725,6 +767,16 @@ class FacebookGraphQLGroupCrawler:
             while not self.stop_scanning:
                 if self.stop_callback():
                     self._set_stop_reason("user_stop")
+                    break
+
+                if is_out_of_memory_page(self.page):
+                    if self._recover_out_of_memory_page():
+                        no_height_change_count = 0
+                        stale_scroll_count = 0
+                        started_at = time.monotonic()
+                        continue
+                    if not self.stop_reason:
+                        self._set_stop_reason("chrome_out_of_memory")
                     break
 
                 if len(self.collected_posts) >= self.max_posts:
@@ -814,6 +866,7 @@ class FacebookGraphQLGroupCrawler:
                 "posts": list(self.collected_posts),
                 "scroll_count": self.scroll_count,
                 "reload_count": self.reload_count,
+                "oom_reload_count": self.oom_reload_count,
                 "last_graphql_response_at": self.last_graphql_response_at,
                 "stop_reason": self.stop_reason,
             }

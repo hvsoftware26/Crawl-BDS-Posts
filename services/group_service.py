@@ -3,7 +3,7 @@ import time
 from logging import getLogger
 
 from integrations.openai_client import NoCommentDecision, generate_comment_with_openai
-from app_config import GRAPHQL_GROUP_POST_LIMIT, OPENAI_MODEL_NAME
+from app_config import BROWSER_RESTART_EVERY_GROUPS, GRAPHQL_GROUP_POST_LIMIT, OPENAI_MODEL_NAME
 from services.facebook_browser_commenter import FacebookBrowserCommenter
 from services.post_service import (
     build_posts_status,
@@ -38,6 +38,7 @@ class GroupService:
         stop_callback=None,
         console_callback=None,
         browser_context=None,
+        browser_restart_callback=None,
     ):
         self.groups_list = groups_list
         self.delay_next_run = delay_next_run * 60
@@ -62,6 +63,7 @@ class GroupService:
         self.stop_callback = stop_callback or (lambda: False)
         self.console_callback = console_callback or (lambda _message: None)
         self.browser_context = browser_context
+        self.browser_restart_callback = browser_restart_callback
         logger.debug(
             "Initialized GroupService: groups=%s delay_seconds=%s keywords=%s has_token=%s has_cookies=%s has_proxies=%s has_api_key=%s has_browser_context=%s",
             len(groups_list or []),
@@ -167,8 +169,9 @@ class GroupService:
                     post["comment_message"] = comment_message
                     post["comment_source"] = comment_source
                     logger.info(
-                        "Commented valid post by browser successfully: post_id=%s page_name=%s url=%s",
+                        "Commented valid post by browser successfully: post_id=%s comment_id=%s page_name=%s url=%s",
                         post_id,
+                        result.get("comment_id"),
                         result.get("page_name"),
                         result.get("post_url"),
                     )
@@ -181,10 +184,10 @@ class GroupService:
                         )
                     )
                     self.console_callback(
-                        "Da comment bang Chrome/page %s | post_id: %s"
+                        "Da comment bang Chrome/page %s | comment_id: %s"
                         % (
                             result.get("page_name") or "",
-                            post_id or "?",
+                            result.get("comment_id") or "khong doc duoc",
                         )
                     )
                 except NoCommentDecision as e:
@@ -353,6 +356,16 @@ class GroupService:
         for index, group_id in enumerate(self.groups_list):
             if self.stop_callback and self.stop_callback():
                 return
+            if (
+                index > 0
+                and BROWSER_RESTART_EVERY_GROUPS > 0
+                and index % BROWSER_RESTART_EVERY_GROUPS == 0
+                and self.browser_restart_callback
+            ):
+                replacement_context = self.browser_restart_callback()
+                if not replacement_context:
+                    raise RuntimeError("Browser restart did not return a usable context")
+                self.browser_context = replacement_context
             full_posts = []
             filtered_posts = []
             posts_status = []
